@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>教师后台登录</title>
+<style>
+  body{font-family:-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;background:#f5f7fa;
+       display:flex;align-items:center;justify-content:center;height:100vh;margin:0;color:#1f2933;}
+  .card{background:#fff;border-radius:12px;padding:28px;box-shadow:0 1px 4px rgba(0,0,0,.08);width:320px;}
+  h2{margin:0 0 16px;font-size:18px;}
+  input{width:100%;padding:10px;border:1px solid #cbd2d9;border-radius:8px;font-size:14px;margin-bottom:12px;}
+  button{width:100%;padding:10px;border:none;border-radius:8px;background:#3b6fd4;color:#fff;font-size:14px;cursor:pointer;}
+  .err{color:#c0392b;font-size:13px;margin-bottom:10px;}
+  .hint{font-size:12px;color:#9aa5b1;margin-top:10px;}
+</style>
+</head>
+<body>
+<div class="card">
+  <h2>教师后台</h2>
+  {% if error %}<div class="err">{{ error }}</div>{% endif %}
+  <form method="post" action="/admin">
+    <input name="password" type="password" placeholder="请输入后台密码" autofocus>
+    <button type="submit">登录</button>
+  </form>
+  <div class="hint">默认密码 admin123，可在环境变量 ADMIN_PASSWORD 修改。</div>
+</div>
+</body>
+</html>

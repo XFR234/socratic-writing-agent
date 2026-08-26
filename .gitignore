@@ -1,0 +1,8 @@
+# 密钥与本地数据：绝不入库，部署时通过平台环境变量注入
+.env
+*.db
+__pycache__/
+*.pyc
+# macOS 本地启动脚本，非部署所需
+启动.command
+.DS_Store

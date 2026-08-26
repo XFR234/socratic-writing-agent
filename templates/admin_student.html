@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>学生对话详情</title>
+<style>
+  body{font-family:-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;background:#f5f7fa;margin:0;color:#1f2933;}
+  .wrap{max-width:860px;margin:0 auto;padding:20px;}
+  .top{display:flex;justify-content:space-between;align-items:center;margin-bottom:14px;}
+  a.back{color:#3b6fd4;text-decoration:none;font-size:13px;}
+  h1{font-size:19px;margin:0;}
+  .conv{background:#fff;border-radius:12px;padding:16px;margin-bottom:16px;box-shadow:0 1px 4px rgba(0,0,0,.08);}
+  .conv h3{font-size:14px;margin:0 0 10px;color:#52606d;}
+  .msg{padding:10px 12px;border-radius:10px;margin:8px 0;line-height:1.65;max-width:90%;}
+  .ai{background:#eef3fb;}
+  .me{background:#dcefdc;margin-left:auto;}
+  .tag{font-size:11px;color:#7b8794;margin-top:5px;}
+  .day{font-size:12px;color:#9aa5b1;margin:6px 0;}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="top">
+    <h1>{{ stu.name }}{% if stu.sid %} <small style="color:#9aa5b1">（{{ stu.sid }}）</small>{% endif %}</h1>
+    <a class="back" href="/admin/dashboard">← 返回总览</a>
+  </div>
+
+  {% for item in conv_data %}
+    <div class="conv">
+      <h3>对话 #{{ loop.index }} · 第{{ item.conv.round }}轮 · 阶段{{ item.conv.stage }}
+        · 开始 {{ item.conv.created_at }}</h3>
+      {% for m in item.msgs %}
+        <div class="msg {{ 'ai' if m.role=='assistant' else 'me' }}">
+          {{ m.content }}
+          {% if m.strategy %}<div class="tag">{% if m.role=='assistant' %}策略/引导：{% else %}使用策略：{% endif %}{{ m.strategy }}</div>{% endif %}
+        </div>
+      {% endfor %}
+    </div>
+  {% else %}
+    <p style="color:#9aa5b1">该学生暂无对话记录。</p>
+  {% endfor %}
+</div>
+</body>
+</html>

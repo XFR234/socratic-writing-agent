@@ -1,0 +1,339 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover">
+<title>苏格拉底 · 论证训练</title>
+<style>
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body { height: 100%; }
+  body { margin:0; font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+         background:#f7f3eb; color:#3a3326; }
+  .wrap { max-width:860px; margin:0 auto; min-height:100%; display:flex; flex-direction:column; }
+
+  /* 顶部 */
+  .hero { display:flex; align-items:center; gap:12px; padding:12px 14px;
+          background:linear-gradient(135deg,#f3e6c8,#e9d9b4); border-radius:0 0 14px 14px;
+          box-shadow:0 2px 6px rgba(120,90,40,.12); margin:0 8px 8px; }
+  .hero h1 { font-size:17px; margin:0; color:#5b4a2a; }
+  .hero p { margin:3px 0 0; font-size:12px; color:#7a6a48; line-height:1.45; }
+  .avatar { flex:none; }
+
+  /* 主体卡片区 */
+  .main { flex:1; padding:0 8px 8px; overflow:hidden; display:flex; flex-direction:column; }
+  .card { background:#fffdf8; border:1px solid #ece0c4; border-radius:14px;
+          box-shadow:0 1px 4px rgba(120,90,40,.08); padding:16px; }
+
+  /* 登录表单 */
+  .form label { display:block; font-size:14px; color:#7a6a48; margin:12px 0 5px; font-weight:500; }
+  .form input, .form textarea { width:100%; padding:12px; border:1px solid #d8c9a6; border-radius:10px;
+                    font-size:16px; font-family:inherit; background:#fffdf8; }
+  .form textarea { resize:vertical; min-height:110px; }
+  .btn { cursor:pointer; border:none; border-radius:10px; font-size:16px; padding:13px 20px;
+         min-height:46px; touch-action:manipulation; }
+  .btn-primary { background:#b5793a; color:#fff; font-weight:500; }
+  .btn-primary:active { background:#8c5e2d; transform:scale(.98); }
+  .hint { font-size:12.5px; color:#a89878; margin-top:10px; line-height:1.5; }
+
+  /* 对话区 */
+  .chat-card { flex:1; display:flex; flex-direction:column; padding:0; overflow:hidden; }
+  .topbar { display:flex; justify-content:space-between; align-items:center; padding:10px 12px; border-bottom:1px solid #ece0c4; }
+  .stage-badge { font-size:12px; background:#f3e6c8; color:#8a6a2a; padding:5px 11px; border-radius:999px; }
+  .resume { font-size:13px; color:#7a6a48; padding:10px 12px; background:#fcf7ec; border-bottom:1px solid #ece0c4; }
+  #chatbox { flex:1; overflow-y:auto; padding:12px; background:#fcf8ef; min-height:0; }
+  .msg { display:flex; gap:8px; margin:14px 0; align-items:flex-start; }
+  .msg .bubble { max-width:82%; padding:11px 14px; border-radius:16px; line-height:1.65;
+                 white-space:pre-wrap; font-size:15px; word-break:break-word; }
+  .ai .bubble { background:#eef4fb; border:1px solid #d7e6f5; border-top-left-radius:4px; }
+  .me { flex-direction:row-reverse; }
+  .me .bubble { background:#e7f3e3; border:1px solid #cfe7c8; border-top-right-radius:4px; }
+  .msg .tag { display:inline-block; font-size:11px; color:#9a8a64; margin-top:6px; }
+  .small-avatar { flex:none; margin-top:2px; }
+
+  /* 输入区 */
+  .input-area { padding:10px 12px 12px; border-top:1px solid #ece0c4; background:#fffdf8; }
+  .input-row { display:flex; gap:8px; }
+  .input-row input { flex:1; padding:12px 14px; border:1px solid #d8c9a6; border-radius:12px;
+                     font-size:16px; background:#fffdf8; }
+  .input-row .btn { padding:12px 18px; }
+
+  /* 策略卡（阶段二） */
+  .strat-title { font-size:13.5px; color:#b5793a; font-weight:600; margin:0 0 4px; }
+  .order-hint { font-size:12px; color:#a89878; margin:0 0 8px; line-height:1.45; }
+  .strat-grid { display:grid; grid-template-columns:repeat(2,1fr); gap:8px; margin-bottom:10px; }
+  .strat { background:#fffdf8; border:1px solid #d8c9a6; border-radius:10px; padding:11px;
+           cursor:pointer; font-size:13px; text-align:left; line-height:1.4; }
+  .strat:active { border-color:#b5793a; background:#fbf2e2; transform:scale(.98); }
+  .strat b { color:#b5793a; }
+  .strat small { display:block; color:#7a6a48; margin-top:3px; }
+  .strat .tpl { display:block; color:#6a5d40; margin-top:4px; font-size:12px; }
+
+  /* 策略提示面板（阶段一/二都显示） */
+  .tips-card { background:#fffcf5; border:1px dashed #dccba4; border-radius:12px;
+               padding:12px; margin-bottom:10px; }
+  .tips-title { font-size:13px; font-weight:600; color:#8a6a2a; margin:0 0 6px; }
+  .tips-body { font-size:12.5px; color:#7a6a48; line-height:1.55; }
+  .tips-body ul { margin:6px 0 0; padding-left:18px; }
+  .tips-body li { margin:3px 0; }
+  .chip-row { display:flex; flex-wrap:wrap; gap:6px; margin-top:8px; }
+  .chip { background:#f3e6c8; color:#5b4a2a; border:none; border-radius:999px; padding:7px 11px;
+          font-size:12.5px; cursor:pointer; }
+  .chip:active { background:#e6d5ad; }
+
+  /* loading / error */
+  .thinking { color:#9a8a64; font-style:italic; }
+  .err-text { color:#b5793a; }
+
+  .hidden { display:none; }
+
+  /* 手机优先：屏幕更窄时策略卡单列 */
+  @media (max-width: 480px) {
+    .hero { margin:0 6px 6px; padding:10px 12px; gap:10px; }
+    .hero h1 { font-size:16px; }
+    .hero p { font-size:11.5px; }
+    .main { padding:0 6px 6px; }
+    .card { padding:14px; border-radius:12px; }
+    .strat-grid { grid-template-columns:1fr; }
+    .msg .bubble { max-width:88%; font-size:15px; }
+    .topbar { padding:8px 10px; }
+    .input-area { padding:8px 10px 10px; }
+    .input-row input { font-size:16px; }
+    .btn { font-size:15px; }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <!-- 顶部：苏格拉底形象 -->
+  <div class="hero">
+    <span class="avatar">
+      <svg viewBox="0 0 64 64" width="54" height="54" xmlns="http://www.w3.org/2000/svg">
+        <circle cx="32" cy="32" r="31" fill="#f6ecd6"/>
+        <path d="M10 34 Q32 14 54 34 Q54 26 32 22 Q10 26 10 34 Z" fill="#d9c39a"/>
+        <circle cx="32" cy="38" r="19" fill="#f9e7c6"/>
+        <path d="M14 42 Q32 64 50 42 Q50 60 32 62 Q14 60 14 42 Z" fill="#ffffff"/>
+        <circle cx="25" cy="36" r="2.3" fill="#5b4636"/>
+        <circle cx="39" cy="36" r="2.3" fill="#5b4636"/>
+        <path d="M27 43 Q32 46 37 43" stroke="#c79a6b" stroke-width="1.6" fill="none" stroke-linecap="round"/>
+        <circle cx="32" cy="20" r="2" fill="#caa46a"/>
+      </svg>
+    </span>
+    <div>
+      <h1>苏格拉底 · 论证训练</h1>
+      <p>一位爱追问的苏格拉底式伙伴，陪你把观点想得更结实。只问不答，答案由你自己找。</p>
+    </div>
+  </div>
+
+  <div class="main">
+    <!-- 登录/开始 -->
+    <div id="startBox" class="card form {% if logged_in %}hidden{% endif %}">
+      <label>姓名 *</label>
+      <input id="name" placeholder="请输入你的姓名">
+      <label>学号（选填）</label>
+      <input id="sid" placeholder="选填">
+      <div id="essayBox">
+        <label>把你的作文/观点贴进来（选填，阶段一建议粘贴）</label>
+        <textarea id="essay" placeholder="可粘贴前测作文，或写下一个你想讨论的观点，比如：‘我认为短视频让青少年注意力碎片化。’"></textarea>
+      </div>
+      <div style="margin-top:16px">
+        <button class="btn btn-primary" onclick="startChat()">开始对话</button>
+      </div>
+      <div class="hint">对话内容会由教师从后台查看并用于研究分析。请文明交流，避开敏感话题。</div>
+
+      <!-- 登录页策略提示 -->
+      <div class="tips-card" style="margin-top:14px">
+        <div class="tips-title">💡 这里会怎么训练你？</div>
+        <div class="tips-body">
+          苏格拉底不会直接告诉你“该怎么写”，而会用 6 个追问策略陪你想：
+          <ul>
+            <li><b>退一步</b>：先把关键概念说清楚</li>
+            <li><b>环顾式</b>：检查证据能不能撑住论点</li>
+            <li><b>对立面</b>：有没有人可能反对你？</li>
+            <li><b>跳出去</b>：换个角度看还成立吗？</li>
+            <li><b>进一步</b>：如果成立，会推到哪里？</li>
+            <li><b>回顾看</b>：回头看自己的想法变了多少</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+
+    <!-- 对话 -->
+    <div id="chatBox" class="card chat-card {% if not logged_in %}hidden{% endif %}">
+      <div class="topbar">
+        {% if logged_in %}
+          <span class="stage-badge">第{{ round_num }}轮 · {% if stage==1 %}虚拟论敌{% else %}逻辑顾问{% endif %}</span>
+          <a href="/logout" style="font-size:12px;color:#a89878">退出</a>
+        {% endif %}
+      </div>
+
+      {% if logged_in %}<div class="resume">欢迎回来，{{ student_name }}。下面是之前的聊天，你接着聊就行。</div>{% endif %}
+
+      <div id="chatbox"></div>
+
+      <div class="input-area">
+        <!-- 阶段一策略提示（折叠条/常驻） -->
+        {% if stage == 1 %}
+          <div class="tips-card">
+            <div class="tips-title">💡 苏格拉底正在用的追问思路（轮次 {{ round_num }}）</div>
+            <div class="tips-body">
+              当前主要围绕这些角度问你：
+              <ul>
+                {% for s in strategy_order %}
+                  {% if s in round_pool %}
+                    <li><b>{{ s }}</b>：{{ strategies[s].desc }}</li>
+                  {% endif %}
+                {% endfor %}
+              </ul>
+              你可以顺着他的问题答，也可以主动说“我还没想清楚”。
+            </div>
+            <div class="chip-row">
+              <button class="chip" onclick="setInput('我还没想清楚，你能再问具体一点吗？')">我还没想清楚</button>
+              <button class="chip" onclick="setInput('能给我一个生活中的例子吗？')">想要个例子</button>
+              <button class="chip" onclick="setInput('我觉得我的论点是……')">我想重新说论点</button>
+            </div>
+          </div>
+        {% endif %}
+
+        {% if stage == 2 %}
+          <div class="strat-title">策略卡（点一张向苏格拉底提问）</div>
+          <div class="order-hint">使用建议：先用①退一步/④环顾式诊断 → 再用②跳出去/③对立面找薄弱 → 然后用⑤进一步深化 → 最后用⑥回顾看反思</div>
+          <div class="strat-grid">
+            {% for key in stage2_order %}
+              <button class="strat" onclick="useStrategy('{{ key }}')">
+                <b>{{ key }}</b><small>{{ strategies[key].desc }}</small>
+                {% if not simplified %}
+                  {% for t in strategies[key].templates %}
+                    <span class="tpl">· {{ t }}</span>
+                  {% endfor %}
+                {% endif %}
+              </button>
+            {% endfor %}
+          </div>
+        {% endif %}
+
+        <div class="input-row">
+          <input id="msg" placeholder="输入你的回答或问题…" onkeydown="if(event.key==='Enter')send()">
+          <button class="btn btn-primary" onclick="send()">发送</button>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+const stage = {{ stage }};
+const initialHistory = {{ history_messages|tojson }};
+let pendingStrategy = null;
+
+const SAGE_SVG = '<svg class="small-avatar" viewBox="0 0 64 64" width="32" height="32" xmlns="http://www.w3.org/2000/svg"><circle cx="32" cy="32" r="31" fill="#f6ecd6"/><path d="M10 34 Q32 14 54 34 Q54 26 32 22 Q10 26 10 34 Z" fill="#d9c39a"/><circle cx="32" cy="38" r="19" fill="#f9e7c6"/><path d="M14 42 Q32 64 50 42 Q50 60 32 62 Q14 60 14 42 Z" fill="#ffffff"/><circle cx="25" cy="36" r="2.3" fill="#5b4636"/><circle cx="39" cy="36" r="2.3" fill="#5b4636"/><path d="M27 43 Q32 46 37 43" stroke="#c79a6b" stroke-width="1.6" fill="none" stroke-linecap="round"/><circle cx="32" cy="20" r="2" fill="#caa46a"/></svg>';
+
+function escapeHtml(s){return (s||'').replace(/[&<>]/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;'}[c];});}
+
+function addMsg(role, text, strategy) {
+  const box = document.getElementById('chatbox');
+  const wrap = document.createElement('div');
+  wrap.className = 'msg ' + (role==='ai'?'ai':'me');
+  let tag = '';
+  if (strategy) tag = (role==='ai'?'策略：':'使用策略：') + strategy;
+  const inner = (role==='ai'? SAGE_SVG : '') +
+    `<div class="bubble">${escapeHtml(text)}${tag?`<div class="tag">${escapeHtml(tag)}</div>`:''}</div>`;
+  wrap.innerHTML = inner;
+  box.appendChild(wrap);
+  box.scrollTop = box.scrollHeight;
+}
+
+function renderHistory(list) {
+  const box = document.getElementById('chatbox');
+  box.innerHTML = '';
+  (list||[]).forEach(m => addMsg(m.role, m.content, m.strategy));
+}
+
+if (initialHistory && initialHistory.length) {
+  document.getElementById('startBox').classList.add('hidden');
+  document.getElementById('chatBox').classList.remove('hidden');
+  renderHistory(initialHistory);
+}
+
+function startChat() {
+  const name = document.getElementById('name').value.trim();
+  if (!name) { alert('请填写姓名'); return; }
+  const sid = document.getElementById('sid').value.trim();
+  const essay = document.getElementById('essay').value.trim();
+  fetch('/start', {method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'},
+    body:`name=${encodeURIComponent(name)}&sid=${encodeURIComponent(sid)}&essay=${encodeURIComponent(essay)}`})
+    .then(r=>r.json()).then(d=>{
+      if (d.error) { alert(d.error); return; }
+      document.getElementById('startBox').classList.add('hidden');
+      document.getElementById('chatBox').classList.remove('hidden');
+      renderHistory(d.history);
+    });
+}
+
+function setInput(text) {
+  const input = document.getElementById('msg');
+  input.value = text;
+  input.focus();
+}
+
+function useStrategy(key) {
+  pendingStrategy = key;
+  const input = document.getElementById('msg');
+  input.value = `[学生使用策略：${key}] `;
+  input.focus();
+}
+
+let sending = false;
+let resendText = '';
+
+function addLoading() {
+  const box = document.getElementById('chatbox');
+  const wrap = document.createElement('div');
+  wrap.className = 'msg ai';
+  wrap.innerHTML = SAGE_SVG + `<div class="bubble thinking">苏格拉底正在思考…</div>`;
+  box.appendChild(wrap); box.scrollTop = box.scrollHeight;
+  return wrap;
+}
+function removeLoading(el){ if(el && el.parentNode) el.parentNode.removeChild(el); }
+
+function addError() {
+  const box = document.getElementById('chatbox');
+  const wrap = document.createElement('div');
+  wrap.className = 'msg ai';
+  wrap.innerHTML = SAGE_SVG + `<div class="bubble err-text">刚才没听清 😅 <a href="javascript:void(0)" style="color:#b5793a;text-decoration:underline" onclick="retrySend()">点这里重发</a></div>`;
+  box.appendChild(wrap); box.scrollTop = box.scrollHeight;
+}
+
+function retrySend(){ if (resendText) doSend(resendText); }
+
+function doSend(text) {
+  if (sending) return;
+  sending = true;
+  const loading = addLoading();
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 75000);
+  fetch('/chat', {method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'},
+    body:`message=${encodeURIComponent(text)}`, signal: ctrl.signal})
+    .then(r => r.json())
+    .then(d => {
+      clearTimeout(timer); removeLoading(loading); sending = false;
+      if (d.error) { resendText = text; addError(); return; }
+      addMsg('ai', d.reply, d.strategy);
+    })
+    .catch(() => {
+      clearTimeout(timer); removeLoading(loading); sending = false;
+      resendText = text; addError();
+    });
+}
+
+function send() {
+  const input = document.getElementById('msg');
+  const text = input.value.trim();
+  if (!text) return;
+  addMsg('me', text, pendingStrategy?pendingStrategy:'');
+  input.value=''; pendingStrategy=null;
+  doSend(text);
+}
+</script>
+</body>
+</html>

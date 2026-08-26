@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>教师后台 · 对话总览</title>
+<style>
+  body{font-family:-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;background:#f5f7fa;
+       margin:0;color:#1f2933;}
+  .wrap{max-width:980px;margin:0 auto;padding:20px;}
+  .top{display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;}
+  h1{font-size:20px;margin:0;}
+  .bar{display:flex;gap:10px;align-items:center;}
+  a.btn{background:#3b6fd4;color:#fff;padding:8px 14px;border-radius:8px;text-decoration:none;font-size:13px;}
+  a.btn.gray{background:#9aa5b1;}
+  table{width:100%;border-collapse:collapse;background:#fff;border-radius:10px;overflow:hidden;
+        box-shadow:0 1px 4px rgba(0,0,0,.08);font-size:14px;}
+  th,td{padding:11px 12px;text-align:left;border-bottom:1px solid #eef0f2;}
+  th{background:#f0f4f9;color:#52606d;font-weight:600;}
+  tr:hover{background:#fafbfc;}
+  .pill{font-size:12px;padding:3px 9px;border-radius:999px;background:#eef3fb;color:#3b6fd4;}
+  .ok{color:#2f9e44;} .warn{color:#e8590c;}
+  .stage-form{font-size:13px;color:#52606d;}
+  select{padding:6px;border-radius:6px;border:1px solid #cbd2d9;}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="top">
+    <h1>教师后台 · 对话总览</h1>
+    <div class="bar">
+      <form class="stage-form" method="post" action="/admin/settings">
+        当前轮次：
+        <select name="round" onchange="this.form.submit()">
+          <option value="1" {% if round_num==1 %}selected{% endif %}>第1轮 · 阶段一（退一步/对立面/环顾式）</option>
+          <option value="2" {% if round_num==2 %}selected{% endif %}>第2轮 · 阶段一（+跳出去/进一步）</option>
+          <option value="3" {% if round_num==3 %}selected{% endif %}>第3轮 · 阶段二（逻辑顾问·策略卡完整版）</option>
+          <option value="4" {% if round_num==4 %}selected{% endif %}>第4轮 · 阶段二（逻辑顾问·策略卡精简版）</option>
+        </select>
+      </form>
+      <a class="btn" href="/admin/export">导出 CSV</a>
+      <a class="btn gray" href="/admin/logout">退出</a>
+    </div>
+  </div>
+
+  <p style="font-size:13px;color:#52606d">
+    当前部署：<b>第{{ round_num }}轮 · 阶段{{ stage }}</b>
+    （第1-2轮为“被AI追问”虚拟论敌；第3-4轮为“追问AI”逻辑顾问）
+    ｜ 模型状态：{% if api_ok %}<span class="ok">已接入智谱 API（真实对话）</span>
+    {% else %}<span class="warn">Demo 模式（未配置 API key，回答为演示内容）</span>{% endif %}
+    ｜ 共 {{ students|length }} 名学生
+  </p>
+
+  <table>
+    <thead><tr><th>姓名</th><th>学号</th><th>对话数</th><th>最近活跃</th><th>操作</th></tr></thead>
+    <tbody>
+    {% for s in students %}
+      <tr>
+        <td>{{ s.name }}</td>
+        <td>{{ s.sid or '—' }}</td>
+        <td>{{ s.convs }}</td>
+        <td>{{ s.last_active or '—' }}</td>
+        <td><a class="btn" href="/admin/student/{{ s.id }}">查看对话</a></td>
+      </tr>
+    {% else %}
+      <tr><td colspan="5" style="text-align:center;color:#9aa5b1">暂无学生数据</td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</div>
+</body>
+</html>

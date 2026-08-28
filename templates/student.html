@@ -133,7 +133,7 @@
       <label>学号（选填）</label>
       <input id="sid" placeholder="选填">
       <div id="essayBox">
-        <label>把你的作文/观点贴进来（选填，阶段一建议粘贴）</label>
+        <label>把你的作文/观点贴进来（<b>必填</b>：首次进入请粘贴，便于 AI 基于你的写作追问）</label>
         <textarea id="essay" placeholder="可粘贴前测作文，或写下一个你想讨论的观点，比如：‘我认为短视频让青少年注意力碎片化。’"></textarea>
       </div>
       <div style="margin-top:16px">
@@ -163,6 +163,7 @@
       <div class="topbar">
         {% if logged_in %}
           <span class="stage-badge">第{{ round_num }}轮 · {% if stage==1 %}虚拟论敌{% else %}逻辑顾问{% endif %}</span>
+          <a href="javascript:void(0)" onclick="toggleHistory()" style="font-size:12px;color:#a89878;margin-left:auto;margin-right:10px">📜 往期对话</a>
           <a href="/logout" style="font-size:12px;color:#a89878">退出</a>
         {% endif %}
       </div>
@@ -334,6 +335,51 @@ function send() {
   input.value=''; pendingStrategy=null;
   doSend(text);
 }
+
+// ============ 往期对话（只读查看） ============
+function toggleHistory(){
+  const m = document.getElementById('historyModal');
+  if (m.style.display === 'flex') { m.style.display = 'none'; }
+  else { m.style.display = 'flex'; loadHistoryList(); }
+}
+function loadHistoryList(){
+  fetch('/history_list').then(r=>r.json()).then(d=>{
+    const box = document.getElementById('historyList');
+    box.innerHTML = '';
+    const list = d.list || [];
+    if (!list.length) { box.innerHTML = '<div style="color:#9aa5b1;padding:12px">还没有往期对话</div>'; return; }
+    list.forEach(item=>{
+      const div = document.createElement('div');
+      div.style.cssText = 'padding:10px 12px;border:1px solid #eef0f2;border-radius:10px;margin-bottom:8px;cursor:pointer;background:#fafbfc';
+      div.innerHTML = '<div style="font-size:13px;color:#52606d">第'+item.round+'轮 · 阶段'+item.stage+' · '+item.created_at+'</div>'
+                    + '<div style="font-size:12px;color:#9aa5b1;margin-top:4px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">'+((item.preview||'').replace(/</g,'&lt;'))+'</div>';
+      div.onclick = ()=>openHistory(item.conv_id);
+      box.appendChild(div);
+    });
+  });
+}
+function openHistory(cid){
+  fetch('/history/'+cid).then(r=>r.json()).then(d=>{
+    const box = document.getElementById('historyList');
+    box.innerHTML = '<div style="margin-bottom:10px"><a href="javascript:void(0)" onclick="loadHistoryList()" style="color:#3b6fd4;font-size:13px">← 返回列表</a></div>';
+    const list = d.history || [];
+    if (!list.length) { box.innerHTML += '<div style="color:#9aa5b1;padding:8px">该对话暂无消息</div>'; return; }
+    list.forEach(m=>{
+      const wrap = document.createElement('div');
+      wrap.className = 'msg ' + (m.role==='assistant'?'ai':'me');
+      wrap.innerHTML = '<div class="bubble">'+(m.content||'').replace(/</g,'&lt;')+'</div>';
+      box.appendChild(wrap);
+    });
+  });
+}
 </script>
+
+<div id="historyModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.4);z-index:50;align-items:flex-start;justify-content:center;padding-top:60px">
+  <div style="background:#fff;width:92%;max-width:560px;max-height:80vh;overflow:auto;border-radius:14px;padding:16px;box-shadow:0 8px 30px rgba(0,0,0,.2)">
+    <div style="font-size:15px;font-weight:600;margin-bottom:10px;color:#52606d">📜 我的往期对话 <a href="javascript:void(0)" onclick="toggleHistory()" style="float:right;color:#a89878;font-size:13px;font-weight:400">关闭</a></div>
+    <div id="historyList"></div>
+  </div>
+</div>
+
 </body>
 </html>

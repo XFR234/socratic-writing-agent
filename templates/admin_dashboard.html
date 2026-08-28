@@ -51,18 +51,19 @@
   </p>
 
   <table>
-    <thead><tr><th>姓名</th><th>学号</th><th>对话数</th><th>最近活跃</th><th>操作</th></tr></thead>
+    <thead><tr><th>姓名</th><th>学号</th><th>对话数</th><th>最近轮次</th><th>最近活跃</th><th>操作</th></tr></thead>
     <tbody>
     {% for s in students %}
       <tr>
         <td>{{ s.name }}</td>
         <td>{{ s.sid or '—' }}</td>
         <td>{{ s.convs }}</td>
+        <td>{% if s.last_round %}第{{ s.last_round }}轮{% else %}—{% endif %}</td>
         <td>{{ s.last_active or '—' }}</td>
         <td><a class="btn" href="/admin/student/{{ s.id }}">查看对话</a></td>
       </tr>
     {% else %}
-      <tr><td colspan="5" style="text-align:center;color:#9aa5b1">暂无学生数据</td></tr>
+      <tr><td colspan="6" style="text-align:center;color:#9aa5b1">暂无学生数据</td></tr>
     {% endfor %}
     </tbody>
   </table>

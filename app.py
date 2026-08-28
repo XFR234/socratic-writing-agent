@@ -26,7 +26,7 @@ from flask import (
 from prompts import (
     STRATEGY_INFO, STRATEGY_ORDER, STAGE2_SYSTEM, STAGE1_OPENING_NO_ESSAY,
     STAGE2_OPENING, build_stage1_opening, build_stage2_user_prefix,
-    build_stage1_system, ROUND_STAGE,
+    build_stage1_system, ROUND_STAGE, TOULMIN_MAP,
 )
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -269,13 +269,17 @@ def start():
                            (name, sid, now_str()))
         student_id = cur.lastrowid
 
-    # 复用该学生最近的对话：学生能看到历史、AI 上下文带旧对话从而记住断裂点；
-    # 并把该对话同步到教师当前设定的轮次/阶段（学生继续对话，阶段跟随老师）。
-    latest = get_latest_conversation(student_id)
-    if latest:
-        conv_id = latest["id"]
-        conn.execute("UPDATE conversations SET round=?, stage=? WHERE id=?",
-                     (round_num, stage, conv_id))
+    # 按轮次分对话：每个学生每个轮次一个独立对话，后台/导出天然区分第几轮。
+    conv = conn.execute(
+        "SELECT id, essay FROM conversations WHERE student_id=? AND round=? "
+        "ORDER BY created_at DESC LIMIT 1",
+        (student_id, round_num)).fetchone()
+
+    if conv:
+        # 复用“当前轮次”的对话（学生看到本轮历史；AI 上下文已含旧对话，记住断裂点）
+        conv_id = conv["id"]
+        if not essay and conv["essay"]:
+            essay = conv["essay"]  # 本轮已有作文则沿用
         rows = conn.execute(
             "SELECT role, content, strategy FROM messages WHERE conversation_id=? ORDER BY id",
             (conv_id,)).fetchall()
@@ -283,16 +287,30 @@ def start():
                    for r in rows]
         opening = None  # 复用旧对话，历史已含开场，不再生成新开场白
     else:
-        # 首次进入：新建对话并生成开场白
+        # 当前轮次尚无对话：新建。作文必填——若本次未粘贴且无历史作文，则要求填写。
+        existing = conn.execute(
+            "SELECT essay FROM conversations WHERE student_id=? AND essay IS NOT NULL "
+            "AND essay<>'' ORDER BY created_at DESC LIMIT 1", (student_id,)).fetchone()
+        base_essay = essay or (existing["essay"] if existing else "")
+        if not base_essay:
+            conn.close()
+            return jsonify({"error": "请先粘贴一段你的作文或观点，再开始本轮对话"}), 400
+
         cur = conn.execute(
             "INSERT INTO conversations(student_id, round, stage, essay, created_at) VALUES(?,?,?,?,?)",
-            (student_id, round_num, stage, essay, now_str()))
+            (student_id, round_num, stage, base_essay, now_str()))
         conv_id = cur.lastrowid
-        if stage == 1 and essay:
-            opening, strategy = generate_assistant(1, [], essay=essay, round_num=round_num)
-        elif stage == 1:
-            opening = STAGE1_OPENING_NO_ESSAY
-            strategy = "退一步"
+
+        # 带入该生所有历史对话作为上下文（AI 记住此前轮次的断裂点，实现跨轮次记忆）
+        hist_rows = conn.execute(
+            "SELECT role, content FROM messages m JOIN conversations c "
+            "ON c.id=m.conversation_id WHERE c.student_id=? ORDER BY m.id",
+            (student_id,)).fetchall()
+        history_ctx = [(r["role"], r["content"]) for r in hist_rows]
+
+        if stage == 1:
+            opening, strategy = generate_assistant(1, history_ctx, essay=base_essay,
+                                                   round_num=round_num)
         else:
             opening = STAGE2_OPENING
             strategy = "回顾看"
@@ -366,6 +384,44 @@ def history():
     return jsonify({"history": h})
 
 
+@app.route("/history_list")
+def history_list():
+    """学生端：列出该生所有对话（按轮次），供切换查看往期。"""
+    if "student_id" not in session:
+        return jsonify({"list": []})
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT c.id, c.round, c.stage, c.created_at, "
+        "(SELECT content FROM messages WHERE conversation_id=c.id ORDER BY id LIMIT 1) "
+        "AS first_msg FROM conversations c WHERE c.student_id=? ORDER BY c.created_at DESC",
+        (session["student_id"],)).fetchall()
+    conn.close()
+    out = [{"conv_id": r["id"], "round": r["round"], "stage": r["stage"],
+            "created_at": r["created_at"], "preview": (r["first_msg"] or "")[:36]}
+           for r in rows]
+    return jsonify({"list": out})
+
+
+@app.route("/history/<int:cid>")
+def view_history(cid):
+    """学生端：查看某往期对话的全部消息（只读）。"""
+    if "student_id" not in session:
+        return jsonify({"history": []})
+    conn = get_db()
+    conv = conn.execute("SELECT id FROM conversations WHERE id=? AND student_id=?",
+                        (cid, session["student_id"])).fetchone()
+    if not conv:
+        conn.close()
+        return jsonify({"history": []})
+    rows = conn.execute(
+        "SELECT role, content, strategy FROM messages WHERE conversation_id=? ORDER BY id",
+        (cid,)).fetchall()
+    conn.close()
+    h = [{"role": r["role"], "content": r["content"], "strategy": r["strategy"]}
+         for r in rows]
+    return jsonify({"history": h})
+
+
 @app.route("/logout")
 def logout():
     session.clear()
@@ -393,7 +449,10 @@ def admin_dashboard():
     conn = get_db()
     students = conn.execute(
         "SELECT s.id, s.name, s.sid, COUNT(DISTINCT c.id) AS convs, "
-        "MAX(c.created_at) AS last_active FROM students s "
+        "MAX(c.created_at) AS last_active, "
+        "(SELECT c2.round FROM conversations c2 WHERE c2.student_id=s.id "
+        " ORDER BY c2.created_at DESC LIMIT 1) AS last_round "
+        "FROM students s "
         "LEFT JOIN conversations c ON c.student_id=s.id "
         "GROUP BY s.id ORDER BY last_active DESC").fetchall()
     round_num = get_active_round()
@@ -420,7 +479,8 @@ def admin_student(sid):
             "WHERE conversation_id=? ORDER BY id", (conv["id"],)).fetchall()
         conv_data.append({"conv": conv, "msgs": msgs})
     conn.close()
-    return render_template("admin_student.html", stu=stu, conv_data=conv_data)
+    return render_template("admin_student.html", stu=stu, conv_data=conv_data,
+                           toulmin_map=TOULMIN_MAP)
 
 
 @app.route("/admin/settings", methods=["POST"])
@@ -446,11 +506,12 @@ def admin_export():
     output = io.StringIO()
     writer = csv.writer(output)
     writer.writerow(["姓名", "学号", "轮次", "阶段", "对话开始时间", "角色",
-                     "使用/引导策略", "内容", "消息时间"])
+                     "使用/引导策略", "图尔敏要素", "内容", "消息时间"])
     for r in rows:
+        toulmin = TOULMIN_MAP.get(r["strategy"], "") if r["strategy"] else ""
         writer.writerow([r["name"], r["sid"] or "", r["round"], r["stage"], r["conv_time"],
                          "学生" if r["role"] == "user" else "AI",
-                         r["strategy"] or "", r["content"], r["created_at"]])
+                         r["strategy"] or "", toulmin, r["content"], r["created_at"]])
     data = "\ufeff" + output.getvalue()
     return Response(
         data.encode("utf-8"),

@@ -219,20 +219,73 @@ def generate_assistant(stage, history, last_user="", essay="", round_num=1):
     return parse_strategy_tag(raw)
 
 
+def ensure_round_conversation(student_id, essay=""):
+    """确保该生在当前轮次有一个对话：有则复用，无则按规则新建（含自动开场白）。
+    返回 (conv_id, essay)。若缺少作文无法新建（需学生先粘贴），返回 (None, '')。"""
+    round_num = get_active_round()
+    stage = ROUND_STAGE.get(round_num, 1)
+    conn = get_db()
+    conv = conn.execute(
+        "SELECT id, essay FROM conversations WHERE student_id=? AND round=? "
+        "ORDER BY created_at DESC LIMIT 1",
+        (student_id, round_num)).fetchone()
+    if conv:
+        if not essay and conv["essay"]:
+            essay = conv["essay"]
+        conn.close()
+        return conv["id"], essay
+    # 当前轮次尚无对话：需作文才能新建
+    existing = conn.execute(
+        "SELECT essay FROM conversations WHERE student_id=? AND essay IS NOT NULL "
+        "AND essay<>'' ORDER BY created_at DESC LIMIT 1", (student_id,)).fetchone()
+    base_essay = essay or (existing["essay"] if existing else "")
+    if not base_essay:
+        conn.close()
+        return None, ""
+    cur = conn.execute(
+        "INSERT INTO conversations(student_id, round, stage, essay, created_at) VALUES(?,?,?,?,?)",
+        (student_id, round_num, stage, base_essay, now_str()))
+    conv_id = cur.lastrowid
+    hist_rows = conn.execute(
+        "SELECT role, content FROM messages m JOIN conversations c "
+        "ON c.id=m.conversation_id WHERE c.student_id=? ORDER BY m.id",
+        (student_id,)).fetchall()
+    history_ctx = [(r["role"], r["content"]) for r in hist_rows]
+    if stage == 1:
+        opening, strategy = generate_assistant(1, history_ctx, essay=base_essay,
+                                               round_num=round_num)
+    else:
+        opening = STAGE2_OPENING
+        strategy = "回顾看"
+    conn.execute(
+        "INSERT INTO messages(conversation_id, role, content, strategy, created_at) VALUES(?,?,?,?,?)",
+        (conv_id, "assistant", opening, strategy, now_str()))
+    conn.commit()
+    conn.close()
+    return conv_id, base_essay
+
+
 # ---------------- 路由：学生端 ----------------
 @app.route("/")
 def index():
     logged_in = "student_id" in session
     history_messages = []
-    if logged_in and session.get("conv_id"):
-        conn = get_db()
-        rows = conn.execute(
-            "SELECT role, content, strategy FROM messages "
-            "WHERE conversation_id=? ORDER BY id",
-            (session["conv_id"],)).fetchall()
-        conn.close()
-        history_messages = [{"role": r["role"], "content": r["content"],
-                             "strategy": r["strategy"]} for r in rows]
+    if logged_in and session.get("student_id"):
+        # 打开/刷新页面即按教师当前设定的轮次加载或新建对应对话，
+        # 不必重新提交登录表单，避免“切了轮次却只显示一个”的困惑。
+        student_id = session["student_id"]
+        conv_id, _ = ensure_round_conversation(student_id)
+        if conv_id:
+            session["conv_id"] = conv_id
+            conn = get_db()
+            rows = conn.execute(
+                "SELECT role, content, strategy FROM messages "
+                "WHERE conversation_id=? ORDER BY id",
+                (conv_id,)).fetchall()
+            conn.close()
+            history_messages = [{"role": r["role"], "content": r["content"],
+                                 "strategy": r["strategy"]} for r in rows]
+        # 若 conv_id 为 None（缺作文），保留登录框让用户粘贴，history_messages 为空
     return render_template(
         "student.html",
         student_name=session.get("student_name", ""),
@@ -255,8 +308,6 @@ def start():
     essay = (request.form.get("essay") or "").strip()
     if not name:
         return jsonify({"error": "请填写姓名"}), 400
-    round_num = get_active_round()
-    stage = ROUND_STAGE.get(round_num, 1)
     conn = get_db()
     # 同名复用学生记录
     stu = conn.execute("SELECT id FROM students WHERE name=?", (name,)).fetchone()
@@ -268,63 +319,27 @@ def start():
         cur = conn.execute("INSERT INTO students(name, sid, created_at) VALUES(?,?,?)",
                            (name, sid, now_str()))
         student_id = cur.lastrowid
-
-    # 按轮次分对话：每个学生每个轮次一个独立对话，后台/导出天然区分第几轮。
-    conv = conn.execute(
-        "SELECT id, essay FROM conversations WHERE student_id=? AND round=? "
-        "ORDER BY created_at DESC LIMIT 1",
-        (student_id, round_num)).fetchone()
-
-    if conv:
-        # 复用“当前轮次”的对话（学生看到本轮历史；AI 上下文已含旧对话，记住断裂点）
-        conv_id = conv["id"]
-        if not essay and conv["essay"]:
-            essay = conv["essay"]  # 本轮已有作文则沿用
-        rows = conn.execute(
-            "SELECT role, content, strategy FROM messages WHERE conversation_id=? ORDER BY id",
-            (conv_id,)).fetchall()
-        history = [{"role": r["role"], "content": r["content"], "strategy": r["strategy"]}
-                   for r in rows]
-        opening = None  # 复用旧对话，历史已含开场，不再生成新开场白
-    else:
-        # 当前轮次尚无对话：新建。作文必填——若本次未粘贴且无历史作文，则要求填写。
-        existing = conn.execute(
-            "SELECT essay FROM conversations WHERE student_id=? AND essay IS NOT NULL "
-            "AND essay<>'' ORDER BY created_at DESC LIMIT 1", (student_id,)).fetchone()
-        base_essay = essay or (existing["essay"] if existing else "")
-        if not base_essay:
-            conn.close()
-            return jsonify({"error": "请先粘贴一段你的作文或观点，再开始本轮对话"}), 400
-
-        cur = conn.execute(
-            "INSERT INTO conversations(student_id, round, stage, essay, created_at) VALUES(?,?,?,?,?)",
-            (student_id, round_num, stage, base_essay, now_str()))
-        conv_id = cur.lastrowid
-
-        # 带入该生所有历史对话作为上下文（AI 记住此前轮次的断裂点，实现跨轮次记忆）
-        hist_rows = conn.execute(
-            "SELECT role, content FROM messages m JOIN conversations c "
-            "ON c.id=m.conversation_id WHERE c.student_id=? ORDER BY m.id",
-            (student_id,)).fetchall()
-        history_ctx = [(r["role"], r["content"]) for r in hist_rows]
-
-        if stage == 1:
-            opening, strategy = generate_assistant(1, history_ctx, essay=base_essay,
-                                                   round_num=round_num)
-        else:
-            opening = STAGE2_OPENING
-            strategy = "回顾看"
-        conn.execute(
-            "INSERT INTO messages(conversation_id, role, content, strategy, created_at) VALUES(?,?,?,?,?)",
-            (conv_id, "assistant", opening, strategy, now_str()))
-        history = [{"role": "assistant", "content": opening, "strategy": strategy}]
-
-    conn.commit()
+    conn.commit()   # 必须提交学生记录，否则 students 表为空、后台看不到该生
     conn.close()
+
+    # 按轮次分对话：复用 ensure_round_conversation（与首页刷新同一条逻辑）
+    conv_id, essay = ensure_round_conversation(student_id, essay)
+    if conv_id is None:
+        return jsonify({"error": "请先粘贴一段你的作文或观点，再开始本轮对话"}), 400
+
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT role, content, strategy FROM messages WHERE conversation_id=? ORDER BY id",
+        (conv_id,)).fetchall()
+    conn.close()
+    history = [{"role": r["role"], "content": r["content"], "strategy": r["strategy"]}
+               for r in rows]
     session["student_id"] = student_id
     session["student_name"] = name
     session["conv_id"] = conv_id
-    return jsonify({"ok": True, "opening": opening, "history": history,
+    round_num = get_active_round()
+    stage = ROUND_STAGE.get(round_num, 1)
+    return jsonify({"ok": True, "opening": None, "history": history,
                     "stage": stage, "round": round_num})
 
 

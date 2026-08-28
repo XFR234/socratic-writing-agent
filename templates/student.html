@@ -247,7 +247,8 @@ function addMsg(role, text, strategy) {
 function renderHistory(list) {
   const box = document.getElementById('chatbox');
   box.innerHTML = '';
-  (list||[]).forEach(m => addMsg(m.role, m.content, m.strategy));
+  // 数据库消息角色为 assistant/user，前端气泡分侧认 ai/me，需归一化
+  (list||[]).forEach(m => addMsg(m.role==='assistant'?'ai':'me', m.content, m.strategy));
 }
 
 if (initialHistory && initialHistory.length) {

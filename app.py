@@ -39,6 +39,11 @@ ZHIPU_API_KEY = os.environ.get("ZHIPU_API_KEY", "")
 ZHIPU_URL = "https://open.bigmodel.cn/api/paas/v4/chat/completions"
 MODEL_NAME = os.environ.get("MODEL_NAME", "glm-4-flash")
 
+# 每轮必须提交的作文最小字数：低于此长度视为“只写了一个观点”，不予通过
+MIN_ESSAY_LEN = int(os.environ.get("MIN_ESSAY_LEN", "60"))
+# 每轮追问往返次数上限（收尾的量化兜底；主条件是聚焦的断裂点已被补上）
+DEFAULT_MAX_TURNS = int(os.environ.get("MAX_TURNS", "6"))
+
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "socratic-dev-secret-change-me")
 
@@ -86,6 +91,8 @@ def init_db():
         value TEXT
     )""")
     c.execute("INSERT OR IGNORE INTO settings(key, value) VALUES('active_round','1')")
+    c.execute("INSERT OR IGNORE INTO settings(key, value) VALUES('max_turns',?)",
+              (str(DEFAULT_MAX_TURNS),))
     conn.commit()
     conn.close()
 
@@ -116,6 +123,36 @@ def set_active_round(round_num):
 
 def get_active_stage():
     return ROUND_STAGE.get(get_active_round(), 1)
+
+
+def get_max_turns():
+    """每轮追问往返次数上限（后台可调，2—20）。"""
+    conn = get_db()
+    row = conn.execute("SELECT value FROM settings WHERE key='max_turns'").fetchone()
+    conn.close()
+    try:
+        n = int(row["value"]) if row else DEFAULT_MAX_TURNS
+    except (TypeError, ValueError):
+        n = DEFAULT_MAX_TURNS
+    return max(2, min(20, n))
+
+
+def set_max_turns(n):
+    n = max(2, min(20, int(n)))
+    conn = get_db()
+    conn.execute("UPDATE settings SET value=? WHERE key='max_turns'", (str(n),))
+    conn.commit()
+    conn.close()
+
+
+def has_round_conversation(student_id, round_num):
+    """该生本轮是否已建过对话（已建则本轮不必再次提交作文）。"""
+    conn = get_db()
+    row = conn.execute(
+        "SELECT id FROM conversations WHERE student_id=? AND round=? LIMIT 1",
+        (student_id, round_num)).fetchone()
+    conn.close()
+    return bool(row)
 
 
 def get_latest_conversation(student_id):
@@ -167,9 +204,15 @@ def call_zhipu(system_prompt, history):
 DEMO_STRATEGY_CYCLE = STRATEGY_ORDER
 
 
-def demo_respond(stage, history, last_user, round_num=1):
+def demo_respond(stage, history, last_user, round_num=1, force_wrapup=False):
     """无 API key 时的演示应答，保证界面可跑通流程。"""
     if stage == 1:
+        if force_wrapup:
+            # 演示模式下也走一遍收尾：先梳理，再请学生回看，最后明确结束
+            return ("（演示模式·收尾）咱们这组问题聊到这儿。回头看一下：你一开始给的是一个比较"
+                    "笼统的说法，中间我追着问了两轮，你才把「你的例子到底是怎么支持观点」这一层"
+                    "讲清楚；反方会怎么说，你后来也想到了。现在你觉得自己的论证哪一部分变结实了？"
+                    "如果重写这篇作文，你会改哪里？\n\n【策略：回顾看】")
         turn = max(0, len([h for h in history if h[0] == "user"]))
         # 阶段一按轮次可用策略池轮换，保持与研究设计一致
         from prompts import ROUND_POOL
@@ -193,16 +236,21 @@ def demo_respond(stage, history, last_user, round_num=1):
                 f"你能先自己说说：按这个角度，你现在的论证哪里还站不稳吗？\n\n【引导：{strat}】")
 
 
-def generate_assistant(stage, history, last_user="", essay="", round_num=1):
+def generate_assistant(stage, history, last_user="", essay="", round_num=1, force_wrapup=False):
     """返回 (text, strategy)。"""
     if stage == 1:
-        system_prompt = build_stage1_system(round_num)
-        if essay and essay.strip() and not history:
-            # 仅在首次（无历史）把作文作为首条 user 消息，让 AI 基于作文开问；
-            # 之后一律用 history，保留完整上下文，AI 才能记住断裂点、基于学生回答继续追问
-            api_history = [("user", "【学生提交的前测作文】\n" + essay.strip()
-                            + "\n请直接基于这篇作文，抛出一个具体的追问问题作为第一次对话，"
-                              "第一句话就是问题本身，不要先分析、不要列诊断清单。")]
+        system_prompt = build_stage1_system(round_num, force_wrapup)
+        if essay and essay.strip():
+            # 本轮作文作为最后一条 user 消息交给模型：
+            #   · 第1轮无历史时，等于“基于作文开问”；
+            #   · 第2轮起 history 非空，模型既能看到上一轮追问过什么，
+            #     也能读到本轮新提交的作文（不能因为 history 非空就丢掉本轮作文）
+            api_history = history + [(
+                "user",
+                "【学生本轮提交的作文】\n" + essay.strip()
+                + "\n请直接基于这篇作文，按你的优先顺序找出最突出的断裂点，抛出一个具体的"
+                  "追问问题作为本轮第一次追问。第一句话就是问题本身，不要先分析、不要列诊断清单。",
+            )]
         else:
             api_history = history
     else:
@@ -213,15 +261,15 @@ def generate_assistant(stage, history, last_user="", essay="", round_num=1):
             raw = call_zhipu(system_prompt, api_history)
             return parse_strategy_tag(raw)
         except Exception:
-            raw = demo_respond(stage, history, last_user, round_num)
+            raw = demo_respond(stage, history, last_user, round_num, force_wrapup)
             return parse_strategy_tag(raw)
-    raw = demo_respond(stage, history, last_user, round_num)
+    raw = demo_respond(stage, history, last_user, round_num, force_wrapup)
     return parse_strategy_tag(raw)
 
 
 def ensure_round_conversation(student_id, essay=""):
     """确保该生在当前轮次有一个对话：有则复用，无则按规则新建（含自动开场白）。
-    返回 (conv_id, essay)。若缺少作文无法新建（需学生先粘贴），返回 (None, '')。"""
+    返回 (conv_id, essay)。本轮**必须由学生提交本轮的作文**才能新建；未提交则返回 (None, '')。"""
     round_num = get_active_round()
     stage = ROUND_STAGE.get(round_num, 1)
     conn = get_db()
@@ -234,14 +282,12 @@ def ensure_round_conversation(student_id, essay=""):
             essay = conv["essay"]
         conn.close()
         return conv["id"], essay
-    # 当前轮次尚无对话：需作文才能新建
-    existing = conn.execute(
-        "SELECT essay FROM conversations WHERE student_id=? AND essay IS NOT NULL "
-        "AND essay<>'' ORDER BY created_at DESC LIMIT 1", (student_id,)).fetchone()
-    base_essay = essay or (existing["essay"] if existing else "")
-    if not base_essay:
+    # 当前轮次尚无对话：必须由学生提交本轮的作文才能新建。
+    # 不再复用上一轮的旧稿——否则学生会拿前测作文重开第2轮，AI 只能问出一模一样的问题。
+    if not essay:
         conn.close()
         return None, ""
+    base_essay = essay
     cur = conn.execute(
         "INSERT INTO conversations(student_id, round, stage, essay, created_at) VALUES(?,?,?,?,?)",
         (student_id, round_num, stage, base_essay, now_str()))
@@ -270,6 +316,9 @@ def ensure_round_conversation(student_id, essay=""):
 def index():
     logged_in = "student_id" in session
     history_messages = []
+    turn_count = 0
+    wrapped = False
+    max_turns_now = get_max_turns()
     if logged_in and session.get("student_id"):
         # 打开/刷新页面即按教师当前设定的轮次加载或新建对应对话，
         # 不必重新提交登录表单，避免“切了轮次却只显示一个”的困惑。
@@ -285,7 +334,11 @@ def index():
             conn.close()
             history_messages = [{"role": r["role"], "content": r["content"],
                                  "strategy": r["strategy"]} for r in rows]
-        # 若 conv_id 为 None（缺作文），保留登录框让用户粘贴，history_messages 为空
+            turn_count = len([m for m in history_messages if m["role"] == "user"])
+            wrapped = (any(m["strategy"] == "回顾看" for m in history_messages
+                           if m["role"] == "assistant")
+                       or (get_active_stage() == 1 and turn_count >= max_turns_now))
+        # 若 conv_id 为 None（本轮尚未提交作文），保留登录框让用户粘贴，history_messages 为空
     return render_template(
         "student.html",
         student_name=session.get("student_name", ""),
@@ -296,6 +349,10 @@ def index():
         stage2_order=__import__("prompts").STAGE2_CARD_ORDER,
         round_pool=__import__("prompts").ROUND_POOL.get(get_active_round(), __import__("prompts").ROUND_POOL[1]),
         simplified=__import__("prompts").ROUND_SIMPLIFIED.get(get_active_round(), False),
+        min_essay_len=MIN_ESSAY_LEN,
+        max_turns=max_turns_now,
+        turn_count=turn_count,
+        wrapped=wrapped,
         logged_in=logged_in,
         history_messages=history_messages,
     )
@@ -322,10 +379,20 @@ def start():
     conn.commit()   # 必须提交学生记录，否则 students 表为空、后台看不到该生
     conn.close()
 
+    # 本轮尚未建对话时，必须提交**本轮**的作文（不接受只写一个观点）
+    round_num = get_active_round()
+    if not has_round_conversation(student_id, round_num):
+        if not essay:
+            return jsonify({"error": "请先粘贴你本轮的作文，再开始对话"}), 400
+        if len(essay) < MIN_ESSAY_LEN:
+            return jsonify({
+                "error": "请粘贴完整的作文（不少于 %d 字）。只写一句观点不够——"
+                         "AI 要读完整篇，才能找到你论证里的问题。" % MIN_ESSAY_LEN}), 400
+
     # 按轮次分对话：复用 ensure_round_conversation（与首页刷新同一条逻辑）
     conv_id, essay = ensure_round_conversation(student_id, essay)
     if conv_id is None:
-        return jsonify({"error": "请先粘贴一段你的作文或观点，再开始本轮对话"}), 400
+        return jsonify({"error": "请先粘贴你本轮的作文，再开始对话"}), 400
 
     conn = get_db()
     rows = conn.execute(
@@ -337,10 +404,11 @@ def start():
     session["student_id"] = student_id
     session["student_name"] = name
     session["conv_id"] = conv_id
-    round_num = get_active_round()
     stage = ROUND_STAGE.get(round_num, 1)
+    turn_count = len([m for m in history if m["role"] == "user"])
     return jsonify({"ok": True, "opening": None, "history": history,
-                    "stage": stage, "round": round_num})
+                    "stage": stage, "round": round_num,
+                    "turn_count": turn_count, "max_turns": get_max_turns()})
 
 
 @app.route("/chat", methods=["POST"])
@@ -359,9 +427,15 @@ def chat():
     essay = conv["essay"] or ""
     # 取历史
     rows = conn.execute(
-        "SELECT role, content FROM messages WHERE conversation_id=? ORDER BY id",
+        "SELECT role, content, strategy FROM messages WHERE conversation_id=? ORDER BY id",
         (conv_id,)).fetchall()
     history = [(r["role"], r["content"]) for r in rows]
+    # 收尾判据：主条件由 AI 判断“聚焦的断裂点已补上”后主动收尾（标注回顾看）；
+    # 量化兜底为每轮往返上限，到顶即强制收尾，避免学生不知道什么时候聊完。
+    max_turns = get_max_turns()
+    user_turns = len([r for r in rows if r["role"] == "user"]) + 1   # 含本次
+    already_wrapped = any(r["strategy"] == "回顾看" for r in rows if r["role"] == "assistant")
+    force_wrapup = (stage == 1 and (user_turns >= max_turns or already_wrapped))
     # 阶段二：学生用策略卡，记录策略
     strategy_used = ""
     raw_user = user_text
@@ -375,13 +449,19 @@ def chat():
         "INSERT INTO messages(conversation_id, role, content, strategy, created_at) VALUES(?,?,?,?,?)",
         (conv_id, "user", user_text, strategy_used, now_str()))
     # 生成 AI 回复
-    text, strategy = generate_assistant(stage, history, raw_user, essay, round_num)
+    text, strategy = generate_assistant(stage, history, raw_user, essay, round_num,
+                                        force_wrapup)
     conn.execute(
         "INSERT INTO messages(conversation_id, role, content, strategy, created_at) VALUES(?,?,?,?,?)",
         (conv_id, "assistant", text, strategy, now_str()))
     conn.commit()
     conn.close()
-    return jsonify({"reply": text, "strategy": strategy})
+    # 收尾状态：模型主动收尾（回顾看）、或此前已收尾、或已到往返上限
+    wrapped = (strategy == "回顾看" or already_wrapped
+               or (stage == 1 and user_turns >= max_turns))
+    return jsonify({"reply": text, "strategy": strategy,
+                    "turn": user_turns, "max_turns": max_turns,
+                    "wrapped": wrapped})
 
 
 @app.route("/history")
@@ -475,7 +555,8 @@ def admin_dashboard():
     api_ok = bool(ZHIPU_API_KEY)
     conn.close()
     return render_template("admin_dashboard.html", students=students,
-                           round_num=round_num, stage=stage, api_ok=api_ok)
+                           round_num=round_num, stage=stage, api_ok=api_ok,
+                           max_turns=get_max_turns())
 
 
 @app.route("/admin/student/<int:sid>")
@@ -502,8 +583,11 @@ def admin_student(sid):
 def admin_settings():
     if not session.get("admin"):
         return redirect(url_for("admin_login"))
-    round_num = int(request.form.get("round", 1))
-    set_active_round(round_num)
+    # 轮次与追问上限是两个独立表单，分别提交，按实际提交字段更新
+    if request.form.get("round"):
+        set_active_round(int(request.form.get("round")))
+    if request.form.get("max_turns"):
+        set_max_turns(int(request.form.get("max_turns")))
     return redirect(url_for("admin_dashboard"))
 
 
@@ -521,7 +605,7 @@ def admin_export():
     output = io.StringIO()
     writer = csv.writer(output)
     writer.writerow(["姓名", "学号", "轮次", "阶段", "对话开始时间", "角色",
-                     "使用/引导策略", "图尔敏要素", "内容", "消息时间"])
+                     "使用/引导策略", "图尔敏断裂点", "内容", "消息时间"])
     for r in rows:
         toulmin = TOULMIN_MAP.get(r["strategy"], "") if r["strategy"] else ""
         writer.writerow([r["name"], r["sid"] or "", r["round"], r["stage"], r["conv_time"],

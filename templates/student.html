@@ -133,8 +133,8 @@
       <label>学号（选填）</label>
       <input id="sid" placeholder="选填">
       <div id="essayBox">
-        <label>把你的作文/观点贴进来（<b>必填</b>：首次进入请粘贴，便于 AI 基于你的写作追问）</label>
-        <textarea id="essay" placeholder="可粘贴前测作文，或写下一个你想讨论的观点，比如：‘我认为短视频让青少年注意力碎片化。’"></textarea>
+        <label>粘贴你<b>本轮</b>的作文（<b>必填</b>）</label>
+        <textarea id="essay" placeholder="把这一轮的作文完整粘贴进来（整篇或完整的段落，不少于 {{ min_essay_len }} 字）。只写一句观点不够——AI 要读完整篇，才能找到你论证里的问题。"></textarea>
       </div>
       <div style="margin-top:16px">
         <button class="btn btn-primary" onclick="startChat()">开始对话</button>
@@ -163,6 +163,9 @@
       <div class="topbar">
         {% if logged_in %}
           <span class="stage-badge">第{{ round_num }}轮 · {% if stage==1 %}虚拟论敌{% else %}逻辑顾问{% endif %}</span>
+          {% if stage == 1 %}
+            <span id="progress" style="font-size:12px;color:#a89878;margin-left:10px">{% if wrapped %}本组追问已结束{% else %}本组追问 {{ turn_count }}/{{ max_turns }}{% endif %}</span>
+          {% endif %}
           <a href="javascript:void(0)" onclick="toggleHistory()" style="font-size:12px;color:#a89878;margin-left:auto;margin-right:10px">📜 往期对话</a>
           <a href="/logout" style="font-size:12px;color:#a89878">退出</a>
         {% endif %}
@@ -225,7 +228,24 @@
 <script>
 const stage = {{ stage }};
 const initialHistory = {{ history_messages|tojson }};
+const MIN_ESSAY_LEN = {{ min_essay_len }};
+const INIT_TURN = {{ turn_count }};
+const INIT_MAX = {{ max_turns }};
+const WRAPPED = {{ 'true' if wrapped else 'false' }};
 let pendingStrategy = null;
+
+// 本组追问进度：让学生和老师都知道这组问题还剩多久（收尾由 AI 在断裂点补完后主动发起）
+function updateProgress(turn, max) {
+  const el = document.getElementById('progress');
+  if (!el || turn == null) return;
+  el.textContent = '本组追问 ' + turn + '/' + max;
+}
+function showWrapped() {
+  const el = document.getElementById('progress');
+  if (el) el.textContent = '本组追问已结束';
+  const inp = document.getElementById('msg');
+  if (inp) inp.placeholder = '本组对话已结束。可以点右上角「往期对话」回看，或等老师安排下一轮。';
+}
 
 const SAGE_SVG = '<svg class="small-avatar" viewBox="0 0 64 64" width="32" height="32" xmlns="http://www.w3.org/2000/svg"><circle cx="32" cy="32" r="31" fill="#f6ecd6"/><path d="M10 34 Q32 14 54 34 Q54 26 32 22 Q10 26 10 34 Z" fill="#d9c39a"/><circle cx="32" cy="38" r="19" fill="#f9e7c6"/><path d="M14 42 Q32 64 50 42 Q50 60 32 62 Q14 60 14 42 Z" fill="#ffffff"/><circle cx="25" cy="36" r="2.3" fill="#5b4636"/><circle cx="39" cy="36" r="2.3" fill="#5b4636"/><path d="M27 43 Q32 46 37 43" stroke="#c79a6b" stroke-width="1.6" fill="none" stroke-linecap="round"/><circle cx="32" cy="20" r="2" fill="#caa46a"/></svg>';
 
@@ -255,6 +275,7 @@ if (initialHistory && initialHistory.length) {
   document.getElementById('startBox').classList.add('hidden');
   document.getElementById('chatBox').classList.remove('hidden');
   renderHistory(initialHistory);
+  if (WRAPPED) showWrapped(); else updateProgress(INIT_TURN, INIT_MAX);
 }
 
 function startChat() {
@@ -262,6 +283,11 @@ function startChat() {
   if (!name) { alert('请填写姓名'); return; }
   const sid = document.getElementById('sid').value.trim();
   const essay = document.getElementById('essay').value.trim();
+  if (essay.length < MIN_ESSAY_LEN) {
+    alert('请粘贴完整的作文（不少于 ' + MIN_ESSAY_LEN + ' 字）。\n'
+        + '只写一句观点不够——AI 要读完整篇，才能找到你论证里的问题。');
+    return;
+  }
   fetch('/start', {method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'},
     body:`name=${encodeURIComponent(name)}&sid=${encodeURIComponent(sid)}&essay=${encodeURIComponent(essay)}`})
     .then(r=>r.json()).then(d=>{
@@ -269,6 +295,7 @@ function startChat() {
       document.getElementById('startBox').classList.add('hidden');
       document.getElementById('chatBox').classList.remove('hidden');
       renderHistory(d.history);
+      updateProgress(d.turn_count, d.max_turns);
     });
 }
 
@@ -321,6 +348,7 @@ function doSend(text) {
       clearTimeout(timer); removeLoading(loading); sending = false;
       if (d.error) { resendText = text; addError(); return; }
       addMsg('ai', d.reply, d.strategy);
+      if (d.wrapped) showWrapped(); else updateProgress(d.turn, d.max_turns);
     })
     .catch(() => {
       clearTimeout(timer); removeLoading(loading); sending = false;

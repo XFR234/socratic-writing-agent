@@ -32,7 +32,7 @@
       {% for m in item.msgs %}
         <div class="msg {{ 'ai' if m.role=='assistant' else 'me' }}">
           {{ m.content }}
-          {% if m.strategy %}<div class="tag">{% if m.role=='assistant' %}策略/引导：{% else %}使用策略：{% endif %}{{ m.strategy }} ｜ 图尔敏：{{ toulmin_map.get(m.strategy, '') }}</div>{% endif %}
+          {% if m.strategy %}<div class="tag">{% if m.role=='assistant' %}策略/引导：{% else %}使用策略：{% endif %}{{ m.strategy }} ｜ 图尔敏断裂点：{{ toulmin_map.get(m.strategy, '') }}</div>{% endif %}
         </div>
       {% endfor %}
     </div>

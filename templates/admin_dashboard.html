@@ -37,6 +37,14 @@
           <option value="4" {% if round_num==4 %}selected{% endif %}>第4轮 · 阶段二（逻辑顾问·策略卡精简版）</option>
         </select>
       </form>
+      <form class="stage-form" method="post" action="/admin/settings">
+        每轮追问上限：
+        <select name="max_turns" onchange="this.form.submit()">
+          {% for n in [4, 6, 8, 10, 12] %}
+            <option value="{{ n }}" {% if max_turns==n %}selected{% endif %}>{{ n }} 个来回</option>
+          {% endfor %}
+        </select>
+      </form>
       <a class="btn" href="/admin/export">导出 CSV</a>
       <a class="btn gray" href="/admin/logout">退出</a>
     </div>
@@ -45,6 +53,7 @@
   <p style="font-size:13px;color:#52606d">
     当前部署：<b>第{{ round_num }}轮 · 阶段{{ stage }}</b>
     （第1-2轮为“被AI追问”虚拟论敌；第3-4轮为“追问AI”逻辑顾问）
+    ｜ 每轮追问上限：<b>{{ max_turns }}</b> 个来回
     ｜ 模型状态：{% if api_ok %}<span class="ok">已接入智谱 API（真实对话）</span>
     {% else %}<span class="warn">Demo 模式（未配置 API key，回答为演示内容）</span>{% endif %}
     ｜ 共 {{ students|length }} 名学生

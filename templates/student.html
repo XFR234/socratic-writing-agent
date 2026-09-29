@@ -164,7 +164,7 @@
         {% if logged_in %}
           <span class="stage-badge">第{{ round_num }}轮 · {% if stage==1 %}虚拟论敌{% else %}逻辑顾问{% endif %}</span>
           {% if stage == 1 %}
-            <span id="progress" style="font-size:12px;color:#a89878;margin-left:10px">{% if wrapped %}本组追问已结束{% else %}本组追问 {{ turn_count }}/{{ max_turns }}{% endif %}</span>
+            <span id="progress" style="font-size:12px;color:#a89878;margin-left:10px">{% if wrapped %}本组对话已结束{% endif %}</span>
           {% endif %}
           <a href="javascript:void(0)" onclick="toggleHistory()" style="font-size:12px;color:#a89878;margin-left:auto;margin-right:10px">📜 往期对话</a>
           <a href="/logout" style="font-size:12px;color:#a89878">退出</a>
@@ -179,9 +179,9 @@
         <!-- 阶段一策略提示（折叠条/常驻） -->
         {% if stage == 1 %}
           <div class="tips-card">
-            <div class="tips-title">💡 苏格拉底正在用的追问思路（轮次 {{ round_num }}）</div>
+            <div class="tips-title">💡 苏格拉底会从这些角度问你（本轮策略全开）</div>
             <div class="tips-body">
-              当前主要围绕这些角度问你：
+              他会先读完你的作文，挑出其中最弱的地方，再从下面的角度里选一个问你：
               <ul>
                 {% for s in strategy_order %}
                   {% if s in round_pool %}
@@ -189,6 +189,7 @@
                   {% endif %}
                 {% endfor %}
               </ul>
+              聊到合适的时候，他会用第六个策略「<b>回顾看</b>」帮你回头梳理这一组对话——他说完这段，这一组就聊完了。
               你可以顺着他的问题答，也可以主动说“我还没想清楚”。
             </div>
             <div class="chip-row">
@@ -229,20 +230,13 @@
 const stage = {{ stage }};
 const initialHistory = {{ history_messages|tojson }};
 const MIN_ESSAY_LEN = {{ min_essay_len }};
-const INIT_TURN = {{ turn_count }};
-const INIT_MAX = {{ max_turns }};
 const WRAPPED = {{ 'true' if wrapped else 'false' }};
 let pendingStrategy = null;
 
-// 本组追问进度：让学生和老师都知道这组问题还剩多久（收尾由 AI 在断裂点补完后主动发起）
-function updateProgress(turn, max) {
-  const el = document.getElementById('progress');
-  if (!el || turn == null) return;
-  el.textContent = '本组追问 ' + turn + '/' + max;
-}
+// 收尾由 AI 自己判断（没有固定轮数）：它以「回顾看」帮你梳理完，这一组就结束了
 function showWrapped() {
   const el = document.getElementById('progress');
-  if (el) el.textContent = '本组追问已结束';
+  if (el) el.textContent = '本组对话已结束';
   const inp = document.getElementById('msg');
   if (inp) inp.placeholder = '本组对话已结束。可以点右上角「往期对话」回看，或等老师安排下一轮。';
 }
@@ -275,7 +269,7 @@ if (initialHistory && initialHistory.length) {
   document.getElementById('startBox').classList.add('hidden');
   document.getElementById('chatBox').classList.remove('hidden');
   renderHistory(initialHistory);
-  if (WRAPPED) showWrapped(); else updateProgress(INIT_TURN, INIT_MAX);
+  if (WRAPPED) showWrapped();
 }
 
 function startChat() {
@@ -295,7 +289,7 @@ function startChat() {
       document.getElementById('startBox').classList.add('hidden');
       document.getElementById('chatBox').classList.remove('hidden');
       renderHistory(d.history);
-      updateProgress(d.turn_count, d.max_turns);
+      if (WRAPPED) showWrapped();
     });
 }
 
@@ -348,7 +342,7 @@ function doSend(text) {
       clearTimeout(timer); removeLoading(loading); sending = false;
       if (d.error) { resendText = text; addError(); return; }
       addMsg('ai', d.reply, d.strategy);
-      if (d.wrapped) showWrapped(); else updateProgress(d.turn, d.max_turns);
+      if (d.wrapped) showWrapped();
     })
     .catch(() => {
       clearTimeout(timer); removeLoading(loading); sending = false;

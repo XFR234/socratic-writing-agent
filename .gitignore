@@ -6,3 +6,6 @@ __pycache__/
 # macOS 本地启动脚本，非部署所需
 启动.command
 .DS_Store
+# 模拟对话的运行态文件（脚本与作文样例保留，状态与日志不入库）
+sim/sim_state.json
+sim/sim_log.jsonl

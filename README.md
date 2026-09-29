@@ -118,3 +118,19 @@
 - **免费账户约每 3 个月需“续期”**：PA 会发邮件（或 Web 页有按钮）要求点一下确认还在使用，点掉即免费续 3 个月。不点则站点暂停（数据不丢，重新激活即恢复）。
 - **首次访问较慢**：免费账户会休眠冷启动，学生第一次打开可能等 10—30 秒，之后正常。
 - **备份数据**：后台可随时「导出 CSV」；也可在 PA 的 Files 页下载 `socratic-writing-agent/conversations.db`。
+
+## 八、本地模拟跑一组完整对话（教研演示用）
+
+`sim/` 下的脚本能在本地用**真实模型**跑通一整组对话，用来产出「给老师看」的示例；走的是与线上完全相同的路由逻辑（同样的收尾判定、断裂点推进、跨轮次注入），只是把数据库换成本地隔离文件。
+
+```bash
+cd socratic-writing-agent
+python3 sim/run.py reset                  # 清空模拟库，从头开始
+python3 sim/run.py start sim/essay.txt    # 提交作文，AI 读出断裂点并开场追问
+python3 sim/run.py reply "学生的回答"      # 继续下一个来回（可反复调用）
+python3 sim/auto.py                       # 或按 sim/auto.py 里的预置回答一次跑到底（可断点续跑）
+python3 sim/run.py dump                   # 打印本组完整对话（含每轮的策略与断裂点）
+```
+
+- 模拟库为 `sim/sim_conversations.db`，与线上的 `conversations.db` 完全隔离，随便跑不会污染学生数据。
+- **教研演示前建议先清线上库**：模拟/自测产生的数据会混进后台统计。

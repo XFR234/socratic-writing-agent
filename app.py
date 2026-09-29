@@ -26,7 +26,7 @@ from flask import (
 from prompts import (
     STRATEGY_INFO, STRATEGY_ORDER, STAGE2_SYSTEM, STAGE1_OPENING_NO_ESSAY,
     STAGE2_OPENING, build_stage1_opening, build_stage2_user_prefix,
-    build_stage1_system, ROUND_STAGE, TOULMIN_MAP,
+    build_stage1_system, ROUND_STAGE, TOULMIN_MAP, DRAFT_TYPE_BY_ROUND,
 )
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -53,6 +53,13 @@ def get_db():
     return conn
 
 
+def ensure_column(conn, table, column, decl):
+    """轻量迁移：表已存在时补列（线上旧库升级用，避免删库）。"""
+    cols = [r["name"] for r in conn.execute("PRAGMA table_info(%s)" % table).fetchall()]
+    if column not in cols:
+        conn.execute("ALTER TABLE %s ADD COLUMN %s %s" % (table, column, decl))
+
+
 def init_db():
     conn = get_db()
     c = conn.cursor()
@@ -70,6 +77,7 @@ def init_db():
         round INTEGER,
         stage INTEGER,
         essay TEXT,
+        draft_type TEXT,
         created_at TEXT,
         FOREIGN KEY(student_id) REFERENCES students(id)
     )""")
@@ -89,6 +97,12 @@ def init_db():
         value TEXT
     )""")
     c.execute("INSERT OR IGNORE INTO settings(key, value) VALUES('active_round','1')")
+    # 旧库迁移：补 draft_type 列（第1轮＝原稿 / 第2轮＝升格稿），并回填历史数据
+    ensure_column(conn, "conversations", "draft_type", "TEXT")
+    conn.execute("UPDATE conversations SET draft_type='原稿' "
+                 "WHERE round=1 AND (draft_type IS NULL OR draft_type='')")
+    conn.execute("UPDATE conversations SET draft_type='升格稿' "
+                 "WHERE round=2 AND (draft_type IS NULL OR draft_type='')")
     conn.commit()
     conn.close()
 
@@ -129,6 +143,20 @@ def has_round_conversation(student_id, round_num):
         (student_id, round_num)).fetchone()
     conn.close()
     return bool(row)
+
+
+def get_prev_essay(student_id, round_num):
+    """第2轮（升格稿）需要第1轮的原稿做对照，让 AI 判断"上轮追的断裂点补上了没"。
+    其余轮次返回空串。"""
+    if round_num != 2:
+        return ""
+    conn = get_db()
+    row = conn.execute(
+        "SELECT essay FROM conversations WHERE student_id=? AND round=1 "
+        "AND essay IS NOT NULL AND essay<>'' ORDER BY created_at DESC LIMIT 1",
+        (student_id,)).fetchone()
+    conn.close()
+    return (row["essay"] or "") if row else ""
 
 
 def get_latest_conversation(student_id):
@@ -212,21 +240,31 @@ def demo_respond(stage, history, last_user, round_num=1):
                 f"你能先自己说说：按这个角度，你现在的论证哪里还站不稳吗？\n\n【引导：{strat}】")
 
 
-def generate_assistant(stage, history, last_user="", essay="", round_num=1):
-    """返回 (text, strategy)。"""
+def generate_assistant(stage, history, last_user="", essay="", round_num=1, prev_essay=""):
+    """返回 (text, strategy)。
+    prev_essay：第2轮时传入该生第1轮的原稿，用于"对照升格稿再诊断"。"""
     if stage == 1:
-        system_prompt = build_stage1_system(round_num)
+        system_prompt = build_stage1_system(round_num, prev_essay)
         if essay and essay.strip():
             # 本轮作文作为最后一条 user 消息交给模型：
             #   · 第1轮无历史时，等于“基于作文开问”；
             #   · 第2轮起 history 非空，模型既能看到上一轮追问过什么，
-            #     也能读到本轮新提交的作文（不能因为 history 非空就丢掉本轮作文）
-            api_history = history + [(
-                "user",
-                "【学生本轮提交的作文】\n" + essay.strip()
-                + "\n请直接基于这篇作文，按你的优先顺序找出最突出的断裂点，抛出一个具体的"
-                  "追问问题作为本轮第一次追问。第一句话就是问题本身，不要先分析、不要列诊断清单。",
-            )]
+            #     也能读到本轮新提交的稿子（不能因为 history 非空就丢掉本轮作文）
+            if round_num == 2 and prev_essay and prev_essay.strip():
+                intro = (
+                    "【学生本轮提交的升格稿】\n" + essay.strip()
+                    + "\n这是他在第1轮对话之后自己改出来的稿子。请对照上面附的第1轮原稿，"
+                      "先判断上一轮追的那个断裂点补上了没有，再针对**仍然没补上（或新出现）**"
+                      "的最突出断裂点，抛出本轮的第一个追问。第一句话就是问题本身，"
+                      "不要先分析、不要列诊断清单、不要评价他有没有进步。"
+                )
+            else:
+                intro = (
+                    "【学生本轮提交的作文】\n" + essay.strip()
+                    + "\n请直接基于这篇作文，按你的优先顺序找出最突出的断裂点，抛出一个具体的"
+                      "追问问题作为本轮第一次追问。第一句话就是问题本身，不要先分析、不要列诊断清单。"
+                )
+            api_history = history + [("user", intro)]
         else:
             api_history = history
     else:
@@ -264,9 +302,14 @@ def ensure_round_conversation(student_id, essay=""):
         conn.close()
         return None, ""
     base_essay = essay
+    # 稿次标记：第1轮＝原稿（前测作文），第2轮＝升格稿（第1轮对话后自行修改的同一篇）
+    draft_type = DRAFT_TYPE_BY_ROUND.get(round_num, "")
+    # 第2轮：先取第1轮原稿（写事务之前查，避免与未提交的写操作抢锁）
+    prev_essay = get_prev_essay(student_id, round_num)
     cur = conn.execute(
-        "INSERT INTO conversations(student_id, round, stage, essay, created_at) VALUES(?,?,?,?,?)",
-        (student_id, round_num, stage, base_essay, now_str()))
+        "INSERT INTO conversations(student_id, round, stage, essay, draft_type, created_at) "
+        "VALUES(?,?,?,?,?,?)",
+        (student_id, round_num, stage, base_essay, draft_type, now_str()))
     conv_id = cur.lastrowid
     hist_rows = conn.execute(
         "SELECT role, content FROM messages m JOIN conversations c "
@@ -275,7 +318,8 @@ def ensure_round_conversation(student_id, essay=""):
     history_ctx = [(r["role"], r["content"]) for r in hist_rows]
     if stage == 1:
         opening, strategy = generate_assistant(1, history_ctx, essay=base_essay,
-                                               round_num=round_num)
+                                               round_num=round_num,
+                                               prev_essay=prev_essay)
     else:
         opening = STAGE2_OPENING
         strategy = "回顾看"
@@ -322,6 +366,7 @@ def index():
         stage2_order=__import__("prompts").STAGE2_CARD_ORDER,
         round_pool=__import__("prompts").ROUND_POOL.get(get_active_round(), __import__("prompts").ROUND_POOL[1]),
         simplified=__import__("prompts").ROUND_SIMPLIFIED.get(get_active_round(), False),
+        draft_type=DRAFT_TYPE_BY_ROUND.get(get_active_round(), ""),
         min_essay_len=MIN_ESSAY_LEN,
         wrapped=wrapped,
         logged_in=logged_in,
@@ -390,15 +435,32 @@ def chat():
     conv_id = session["conv_id"]
     conn = get_db()
     conv = conn.execute(
-        "SELECT round, stage, essay FROM conversations WHERE id=?", (conv_id,)).fetchone()
+        "SELECT round, stage, essay, student_id FROM conversations WHERE id=?",
+        (conv_id,)).fetchone()
     round_num = conv["round"]
     stage = conv["stage"]
     essay = conv["essay"] or ""
+    # 第2轮：取第1轮原稿做对照（每个来回都注入，保证全程都能对照原稿判断断裂点是否补上）
+    prev_essay = get_prev_essay(conv["student_id"], round_num) if stage == 1 else ""
     # 取历史
     rows = conn.execute(
         "SELECT role, content, strategy FROM messages WHERE conversation_id=? ORDER BY id",
         (conv_id,)).fetchall()
     history = [(r["role"], r["content"]) for r in rows]
+    # 第2轮＝升格稿对照：把该生第1轮（原稿）的完整对话也带上。
+    # 仅靠开场那一次注入不够——后续每个来回若丢掉上一轮对话，AI 就不知道
+    # "上次追的是哪个断裂点"，对照会退化成重新诊断一遍。
+    if stage == 1 and round_num == 2:
+        prev_rows = conn.execute(
+            "SELECT m.role, m.content FROM messages m JOIN conversations c "
+            "ON c.id=m.conversation_id WHERE c.student_id=? AND c.round=1 "
+            "ORDER BY m.id", (conv["student_id"],)).fetchall()
+        if prev_rows:
+            history = ([("user", "【以下是这位学生上一轮（第1轮·原稿）与你的完整对话记录，"
+                                 "已结束，仅供你对照判断他这次补上了什么，不要直接复述给学生】")]
+                       + [(r["role"], r["content"]) for r in prev_rows]
+                       + [("user", "【上一轮对话记录到此结束。以下是第2轮·升格稿的对话】")]
+                       + history)
     # 收尾判据：**完全由 AI 判断**——它认为本轮聚焦的 2-3 个断裂点已被学生补上时，
     # 主动用「回顾看」收尾（先替学生梳理本组讨论、再请他回看），不设轮数上限。
     already_wrapped = any(r["strategy"] == "回顾看" for r in rows if r["role"] == "assistant")
@@ -415,7 +477,8 @@ def chat():
         "INSERT INTO messages(conversation_id, role, content, strategy, created_at) VALUES(?,?,?,?,?)",
         (conv_id, "user", user_text, strategy_used, now_str()))
     # 生成 AI 回复
-    text, strategy = generate_assistant(stage, history, raw_user, essay, round_num)
+    text, strategy = generate_assistant(stage, history, raw_user, essay, round_num,
+                                        prev_essay)
     conn.execute(
         "INSERT INTO messages(conversation_id, role, content, strategy, created_at) VALUES(?,?,?,?,?)",
         (conv_id, "assistant", text, strategy, now_str()))
@@ -448,12 +511,14 @@ def history_list():
         return jsonify({"list": []})
     conn = get_db()
     rows = conn.execute(
-        "SELECT c.id, c.round, c.stage, c.created_at, "
+        "SELECT c.id, c.round, c.stage, c.draft_type, c.created_at, "
         "(SELECT content FROM messages WHERE conversation_id=c.id ORDER BY id LIMIT 1) "
-        "AS first_msg FROM conversations c WHERE c.student_id=? ORDER BY c.created_at DESC",
+        "AS first_msg FROM conversations c WHERE c.student_id=? "
+        "ORDER BY c.created_at DESC, c.id DESC",
         (session["student_id"],)).fetchall()
     conn.close()
     out = [{"conv_id": r["id"], "round": r["round"], "stage": r["stage"],
+            "draft_type": r["draft_type"] or "",
             "created_at": r["created_at"], "preview": (r["first_msg"] or "")[:36]}
            for r in rows]
     return jsonify({"list": out})
@@ -461,11 +526,12 @@ def history_list():
 
 @app.route("/history/<int:cid>")
 def view_history(cid):
-    """学生端：查看某往期对话的全部消息（只读）。"""
+    """学生端：查看某往期对话的全部消息（只读，附该轮提交的稿子，便于改稿时回看）。"""
     if "student_id" not in session:
         return jsonify({"history": []})
     conn = get_db()
-    conv = conn.execute("SELECT id FROM conversations WHERE id=? AND student_id=?",
+    conv = conn.execute("SELECT id, essay, draft_type FROM conversations "
+                        "WHERE id=? AND student_id=?",
                         (cid, session["student_id"])).fetchone()
     if not conv:
         conn.close()
@@ -476,7 +542,8 @@ def view_history(cid):
     conn.close()
     h = [{"role": r["role"], "content": r["content"], "strategy": r["strategy"]}
          for r in rows]
-    return jsonify({"history": h})
+    return jsonify({"history": h, "essay": conv["essay"] or "",
+                    "draft_type": conv["draft_type"] or ""})
 
 
 @app.route("/logout")
@@ -556,18 +623,19 @@ def admin_export():
         return redirect(url_for("admin_login"))
     conn = get_db()
     rows = conn.execute(
-        "SELECT s.name, s.sid, c.round, c.stage, c.created_at AS conv_time, "
+        "SELECT s.name, s.sid, c.round, c.stage, c.draft_type, c.created_at AS conv_time, "
         "m.role, m.strategy, m.content, m.created_at "
         "FROM messages m JOIN conversations c ON m.conversation_id=c.id "
         "JOIN students s ON c.student_id=s.id ORDER BY s.id, c.id, m.id").fetchall()
     conn.close()
     output = io.StringIO()
     writer = csv.writer(output)
-    writer.writerow(["姓名", "学号", "轮次", "阶段", "对话开始时间", "角色",
+    writer.writerow(["姓名", "学号", "轮次", "稿次", "阶段", "对话开始时间", "角色",
                      "使用/引导策略", "图尔敏断裂点", "内容", "消息时间"])
     for r in rows:
         toulmin = TOULMIN_MAP.get(r["strategy"], "") if r["strategy"] else ""
-        writer.writerow([r["name"], r["sid"] or "", r["round"], r["stage"], r["conv_time"],
+        writer.writerow([r["name"], r["sid"] or "", r["round"], r["draft_type"] or "",
+                         r["stage"], r["conv_time"],
                          "学生" if r["role"] == "user" else "AI",
                          r["strategy"] or "", toulmin, r["content"], r["created_at"]])
     data = "\ufeff" + output.getvalue()

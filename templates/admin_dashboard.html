@@ -31,8 +31,8 @@
       <form class="stage-form" method="post" action="/admin/settings">
         当前轮次：
         <select name="round" onchange="this.form.submit()">
-          <option value="1" {% if round_num==1 %}selected{% endif %}>第1轮 · 阶段一（虚拟论敌·策略全开）</option>
-          <option value="2" {% if round_num==2 %}selected{% endif %}>第2轮 · 阶段一（虚拟论敌·策略全开）</option>
+          <option value="1" {% if round_num==1 %}selected{% endif %}>第1轮 · 阶段一（虚拟论敌·策略全开·前测原稿）</option>
+          <option value="2" {% if round_num==2 %}selected{% endif %}>第2轮 · 阶段一（虚拟论敌·策略全开·追问升格稿）</option>
           <option value="3" {% if round_num==3 %}selected{% endif %}>第3轮 · 阶段二（逻辑顾问·策略卡完整版）</option>
           <option value="4" {% if round_num==4 %}selected{% endif %}>第4轮 · 阶段二（逻辑顾问·策略卡精简版）</option>
         </select>
@@ -47,7 +47,8 @@
     （第1-2轮为“被AI追问”虚拟论敌；第3-4轮为“追问AI”逻辑顾问）
     ｜ 阶段一策略全开（5张追问策略卡均可调用，「回顾看」只用于收尾）
     ｜ 收尾由 AI 判断（聚焦断裂点补完后主动收尾，不设轮数上限）
-    ｜ 每轮须提交本轮作文（≥{{ min_essay_len }} 字）
+    ｜ 第1轮交<b>前测原稿</b>、第2轮交<b>升格稿</b>（同一篇作文的修改版，AI 会对照原稿再诊断）
+    ｜ 每轮须提交作文（≥{{ min_essay_len }} 字）
     ｜ 模型状态：{% if api_ok %}<span class="ok">已接入智谱 API（真实对话）</span>
     {% else %}<span class="warn">Demo 模式（未配置 API key，回答为演示内容）</span>{% endif %}
     ｜ 共 {{ students|length }} 名学生

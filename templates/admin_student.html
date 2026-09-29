@@ -27,8 +27,14 @@
 
   {% for item in conv_data %}
     <div class="conv">
-      <h3>对话 #{{ loop.index }} · 第{{ item.conv.round }}轮 · 阶段{{ item.conv.stage }}
-        · 开始 {{ item.conv.created_at }}</h3>
+      <h3>对话 #{{ loop.index }} · 第{{ item.conv.round }}轮{% if item.conv.draft_type %}（{{ item.conv.draft_type }}）{% endif %}
+        · 阶段{{ item.conv.stage }} · 开始 {{ item.conv.created_at }}</h3>
+      {% if item.conv.essay %}
+        <details style="margin:0 0 10px">
+          <summary style="font-size:12.5px;color:#3b6fd4;cursor:pointer">查看本轮提交的稿子（{{ item.conv.draft_type or '稿子' }}，{{ item.conv.essay|length }} 字）</summary>
+          <div style="font-size:13px;color:#3e4c59;background:#f7f9fc;border:1px solid #eef0f2;border-radius:8px;padding:10px 12px;margin-top:6px;line-height:1.7;white-space:pre-wrap">{{ item.conv.essay }}</div>
+        </details>
+      {% endif %}
       {% for m in item.msgs %}
         <div class="msg {{ 'ai' if m.role=='assistant' else 'me' }}">
           {{ m.content }}

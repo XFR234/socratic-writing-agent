@@ -133,8 +133,14 @@
       <label>学号（选填）</label>
       <input id="sid" placeholder="选填">
       <div id="essayBox">
+        {% if draft_type == '升格稿' %}
+        <label>粘贴你<b>修改后的升格稿</b>（<b>必填</b>）</label>
+        <textarea id="essay" placeholder="把你在第1轮对话之后改出来的那一稿完整粘贴进来（与第1轮同一篇作文的修改版，不少于 {{ min_essay_len }} 字）。第1轮的原稿和对话记录可在右上角「往期对话」里回看。"></textarea>
+        <div class="hint">这一轮苏格拉底会<b>对照你第1轮的稿子</b>再看一遍：上次追问你的那个问题，你补上了没有？</div>
+        {% else %}
         <label>粘贴你<b>本轮</b>的作文（<b>必填</b>）</label>
         <textarea id="essay" placeholder="把这一轮的作文完整粘贴进来（整篇或完整的段落，不少于 {{ min_essay_len }} 字）。只写一句观点不够——AI 要读完整篇，才能找到你论证里的问题。"></textarea>
+        {% endif %}
       </div>
       <div style="margin-top:16px">
         <button class="btn btn-primary" onclick="startChat()">开始对话</button>
@@ -162,7 +168,7 @@
     <div id="chatBox" class="card chat-card {% if not logged_in %}hidden{% endif %}">
       <div class="topbar">
         {% if logged_in %}
-          <span class="stage-badge">第{{ round_num }}轮 · {% if stage==1 %}虚拟论敌{% else %}逻辑顾问{% endif %}</span>
+          <span class="stage-badge">第{{ round_num }}轮 · {% if stage==1 %}虚拟论敌{% else %}逻辑顾问{% endif %}{% if draft_type %}（{{ draft_type }}）{% endif %}</span>
           {% if stage == 1 %}
             <span id="progress" style="font-size:12px;color:#a89878;margin-left:10px">{% if wrapped %}本组对话已结束{% endif %}</span>
           {% endif %}
@@ -374,7 +380,9 @@ function loadHistoryList(){
     list.forEach(item=>{
       const div = document.createElement('div');
       div.style.cssText = 'padding:10px 12px;border:1px solid #eef0f2;border-radius:10px;margin-bottom:8px;cursor:pointer;background:#fafbfc';
-      div.innerHTML = '<div style="font-size:13px;color:#52606d">第'+item.round+'轮 · 阶段'+item.stage+' · '+item.created_at+'</div>'
+      div.innerHTML = '<div style="font-size:13px;color:#52606d">第'+item.round+'轮'
+                    + (item.draft_type ? '（'+escapeHtml(item.draft_type)+'）' : '')
+                    + ' · 阶段'+item.stage+' · '+item.created_at+'</div>'
                     + '<div style="font-size:12px;color:#9aa5b1;margin-top:4px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">'+((item.preview||'').replace(/</g,'&lt;'))+'</div>';
       div.onclick = ()=>openHistory(item.conv_id);
       box.appendChild(div);
@@ -385,6 +393,12 @@ function openHistory(cid){
   fetch('/history/'+cid).then(r=>r.json()).then(d=>{
     const box = document.getElementById('historyList');
     box.innerHTML = '<div style="margin-bottom:10px"><a href="javascript:void(0)" onclick="loadHistoryList()" style="color:#3b6fd4;font-size:13px">← 返回列表</a></div>';
+    // 先显示该轮提交的稿子（第1轮＝原稿、第2轮＝升格稿），便于改稿时回看与对照
+    if (d.essay) {
+      box.innerHTML += '<div style="font-size:12px;color:#9aa5b1;margin-bottom:4px">该轮提交的稿子'
+        + (d.draft_type ? '（'+escapeHtml(d.draft_type)+'）' : '') + '</div>'
+        + '<div style="font-size:13px;color:#52606d;background:#f7f9fc;border:1px solid #eef0f2;border-radius:8px;padding:10px;margin-bottom:12px;line-height:1.7;white-space:pre-wrap">'+escapeHtml(d.essay)+'</div>';
+    }
     const list = d.history || [];
     if (!list.length) { box.innerHTML += '<div style="color:#9aa5b1;padding:8px">该对话暂无消息</div>'; return; }
     list.forEach(m=>{

@@ -171,26 +171,126 @@ def get_latest_conversation(student_id):
 
 
 # ---------------- 模型调用 ----------------
-def parse_strategy_tag(text):
-    """提取末尾【策略：xxx】/【引导：xxx】标注并返回(clean_text, strategy)。"""
-    m = re.search(r"【(?:策略|引导)[：:]\s*(.+?)】", text)
-    if m:
-        strategy = m.group(1).strip()
-        clean = re.sub(r"【(?:策略|引导)[：:].+?】\s*$", "", text).strip()
-        return clean, strategy
-    return text.strip(), ""
+# 研究标注格式：@@策略=环顾式@@ / @@收尾=是@@（写在回复最末尾，解析后剥离，学生看不到）
+META_STRATEGY_RE = re.compile(r"@@\s*策略\s*[=＝:：]\s*(.+?)\s*@@")
+META_WRAP_RE = re.compile(r"@@\s*收尾\s*[=＝:：]\s*(是|否)\s*@@")
+LEGACY_STRATEGY_RE = re.compile(r"【(?:策略|引导)[：:]\s*(.+?)】")
 
 
-def call_zhipu(system_prompt, history):
-    """调用智谱 OpenAI 兼容接口。history: [(role, content), ...]"""
+def parse_meta(text):
+    """把模型回复拆成 (给学生的正文, 引导策略, 是否收尾)。
+
+    这是**降级路径**：正常走的是 JSON 结构化输出（见 JSON_TAIL / parse_json_reply），
+    只有模型没按 JSON 返回、或 JSON 调用失败时才会用到这里，用来兜住旧格式
+    【策略：xx】以及任何残留标注，保证标注不会泄漏到学生端。
+    """
+    raw = text or ""
+    m = META_STRATEGY_RE.search(raw)
+    w = META_WRAP_RE.search(raw)
+    strategy = m.group(1).strip() if m else ""
+    should_wrap = bool(w) and w.group(1) == "是"
+    if not strategy:
+        lm = LEGACY_STRATEGY_RE.search(raw)
+        if lm:
+            strategy = lm.group(1).strip()
+    clean = META_STRATEGY_RE.sub("", raw)
+    clean = META_WRAP_RE.sub("", clean)
+    clean = LEGACY_STRATEGY_RE.sub("", clean)
+    clean = re.sub(r"[ \t]+\n", "\n", clean)
+    clean = re.sub(r"\n{3,}", "\n\n", clean).strip()
+    # 策略名归一化：模型可能写成“策略：环顾式（追问论据）”，这里只保留标准策略名。
+    # 注意遍历用的是 STRATEGY_ORDER 里的标准名，逐个子串匹配即可。
+    if strategy:
+        for s in STRATEGY_ORDER:
+            if s in strategy:
+                strategy = s
+                break
+    if should_wrap:
+        # 收尾回合统一记为「回顾看」，后台与 CSV 才能一眼认出收尾、并对应到
+        # TOULMIN_MAP 里的“整体结构·元认知反思”。
+        strategy = "回顾看"
+    return clean, strategy, should_wrap
+
+
+def build_turn_nudge(stage, is_opening=False, last_user="", wrap_mode="", turn_no=1):
+    """追加在每回合对话末尾的即时指令（「就近约束」）。
+
+    为什么放在末尾而不是系统提示词里：系统提示词很长，模型对其中“怎么问”的约束
+    遵循度低——实测会出现连续几轮追问同一句、每轮都用“你提到……”套话开场的情况。
+    把本回合要做什么紧贴生成位置说一遍，才压得住。
+
+    踩过坑才加上的细节：
+    · 必须**显式引用学生刚说的那句话**。否则模型会顺手引用作文的末句当“他最后这一句”
+      （曾出现 8 轮里 6 轮都在追问作文末句同一处）。
+    · is_opening=True 时不能说“针对他刚才那句”——那是本轮第一次追问。
+    · wrap_mode 把“收尾”变成一个明确指令（"now" 收尾 / "after" 收尾后多说的），
+      而不是让模型自己判断该不该收——实测它判断不出来，会一路追下去。
+    """
+    if stage == 2:
+        return (
+            "（以上是你和他的对话记录。他这一句是拿着策略卡主动来追问你的。"
+            "现在写你这一回合的回应，要求：\n"
+            "1. 你是“逻辑顾问”，只回应、只反问：不替他给出论点、提纲、范文，答案由他自己说。\n"
+            "2. 先让他自查一步，再反问一个问题，不要连甩好几个问题。\n"
+            "3. 不许用“你提到”“我想问一下”“能否具体说明”“换句话说”这类套话开头，"
+            "不许复述他的话当开场，不许重复你前面问过的内容或句式。\n"
+            "4. 研究标注按系统提示词里的 JSON 格式要求输出。）"
+        )
+    if is_opening:
+        return (
+            "（这是本轮的第一个追问。请基于上面【学生本轮提交的作文】写你这回合的回复：\n"
+            "1. 第一句话就是你的问题本身，只问一个问题，不要连续甩好几个问题。\n"
+            "2. 不许先分析、不要列“诊断清单”、不要评价他的作文；不要用“你的作文很有意思”"
+            "这类寒暄，更不要用“你提到”“我想问一下”这类套话开头。\n"
+            "3. 研究标注按系统提示词里的 JSON 格式要求输出。）"
+        )
+    quote = (last_user or "").strip()
+    if len(quote) > 160:
+        quote = quote[:160] + "……"
+    head = ("（以上是你和他的对话记录，这是你和他之间的**第 " + str(turn_no) + " 轮追问**"
+            "（不含开场）。他刚才说的是：“" + quote + "”\n")
+    if wrap_mode == "after":
+        return head + (
+            "他这句是本组已经收尾之后又多说的：**不要再抛新的追问问题**，"
+            "只简短回应他这句，肯定他的回看，并告诉他本组已经聊完、可以进入下一轮。\n"
+            "研究标注按系统提示词里的 JSON 格式要求输出。）")
+    if wrap_mode == "now":
+        return head + (
+            "**这一回合要收尾，不要再问任何新问题。** 学生刚应付完一连串追问，认知负荷已经很高，"
+            "所以按这个顺序说三件事：\n"
+            "1. 先用两三句话替他梳理这组对话：他一开始的说法是什么、中间卡在哪儿、"
+            "最后自己想清楚了什么。只梳理**对话过程和他自己的变化**，不替他补论证、不给结论、"
+            "不给范文或模板；\n"
+            "2. 再请他回看：现在觉得自己的论证哪部分变结实了？如果重写这篇作文，会改哪里？\n"
+            "3. 最后明确告诉他：这组问题到这儿就聊完了。\n"
+            "研究标注按系统提示词里的 JSON 格式要求输出。）")
+    return head + (
+        "现在只针对他这一句里最没说清的一处继续追问：\n"
+        "1. 第一句话就是你的问题本身，只问一个问题，不要连续甩好几个问题。\n"
+        "2. 不许用“你提到”“我想问一下”“能否具体说明”“换句话说”“从某种程度上”这类套话开头，"
+        "不许复述他的话、也不要引用作文里的原句当开场。\n"
+        "3. 不许重复你前面已经问过的内容或句式——他已经答明白的点就往前推进到下一个点。\n"
+        "4. 研究标注按系统提示词里的 JSON 格式要求输出。）")
+
+
+def call_zhipu(system_prompt, history, json_mode=False):
+    """调用智谱 OpenAI 兼容接口。history: [(role, content), ...]
+
+    json_mode=True 时要求模型输出 JSON（智谱支持 response_format），
+    用于稳定拿到「引导策略」「是否收尾」这两个研究字段——实测在长系统提示词下，
+    让模型在正文末尾自行附标注的遵循率很低（约 2/9），改用 JSON 约束才可靠。
+    """
     messages = [{"role": "system", "content": system_prompt}]
     for role, content in history:
         messages.append({"role": role, "content": content})
-    payload = json.dumps({
+    body = {
         "model": MODEL_NAME,
         "messages": messages,
-        "temperature": 0.7,
-    }).encode("utf-8")
+        "temperature": 0.6,
+    }
+    if json_mode:
+        body["response_format"] = {"type": "json_object"}
+    payload = json.dumps(body).encode("utf-8")
     req = urllib.request.Request(
         ZHIPU_URL,
         data=payload,
@@ -205,22 +305,175 @@ def call_zhipu(system_prompt, history):
     return data["choices"][0]["message"]["content"]
 
 
+# 追加在系统提示词末尾的结构化输出要求（配合 response_format=json_object）
+# ---------------- 研究字段的独立判定 ----------------
+# 为什么单开一次调用：GLM-4-Flash 既不稳定在正文末尾附标注（实测仅约 2/9），
+# 也不稳定遵守 response_format=json_object（同一会话里开场遵守、后续就不遵守了）。
+# 把「写话」和「打标」拆开，用极短提示词单独判定，才拿得到可靠的研究字段。
+JUDGE_SYSTEM = (
+    "你是教学对话记录助手，负责给一段“苏格拉底式追问”对话打标注。"
+    "只输出一个 JSON 对象（json），不要输出任何解释文字，也不要用代码块包裹。"
+)
+
+JUDGE_TEMPLATE = """下面是一段高中议论文陪练对话，AI 扮演“只问不答”的追问者。
+
+【学生这一轮说的】{last_user}
+
+【AI 这一轮的回复】{ai_reply}
+
+请判断两点：
+
+1. strategy —— AI 这一轮主要用的是哪一种追问策略（从下面选最贴近的一个）：
+   - 退一步：追问某个关键词、概念到底指什么，要求他把话说清楚；
+   - 环顾式：追问例子与观点之间凭什么成立，为什么这个例子能证明他的观点；
+   - 对立面：追问有没有人反对、什么条件下不成立、话是不是说太满；
+   - 跳出去：换一个视角/领域/情境来检验结论，或指出他用的材料太旧；
+   - 进一步：顺着他的结论往下问，问后果、影响、更深一层的意思。
+   如果这一轮 AI 是在收尾（梳理总结这组讨论、请他回看、说这组聊完了，不再问新问题），
+   strategy 填“回顾看”。
+
+2. wrap —— 这一轮是否属于收尾（true 或 false）。
+
+输出格式：{{"strategy": "策略名", "wrap": false}}"""
+
+
+def parse_json_obj(raw):
+    """从模型返回里尽力抠出一个 JSON 对象，失败返回 None。"""
+    if not raw:
+        return None
+    txt = raw.strip()
+    txt = re.sub(r"^```(?:json)?\s*", "", txt)
+    txt = re.sub(r"\s*```$", "", txt).strip()
+    try:
+        obj = json.loads(txt)
+    except Exception:
+        m = re.search(r"\{[\s\S]*\}", txt)
+        if not m:
+            return None
+        try:
+            obj = json.loads(m.group(0))
+        except Exception:
+            return None
+    return obj if isinstance(obj, dict) else None
+
+
+def judge_turn(last_user, ai_reply):
+    """独立判定本回合的引导策略与是否收尾，返回 (策略, 是否收尾)。
+
+    判定失败返回 ("", False)——不影响学生端对话，后台该行策略留空，便于研究者复核。
+    """
+    if not ZHIPU_API_KEY:
+        return "", False
+    prompt = JUDGE_TEMPLATE.format(last_user=(last_user or "")[:300],
+                                   ai_reply=(ai_reply or "")[:600])
+    try:
+        raw = call_zhipu(JUDGE_SYSTEM, [("user", prompt)], json_mode=True)
+    except Exception:
+        return "", False
+    obj = parse_json_obj(raw)
+    if not obj:
+        return "", False
+    strategy = str(obj.get("strategy") or "").strip()
+    raw_wrap = obj.get("wrap")
+    wrap = raw_wrap if isinstance(raw_wrap, bool) else \
+        str(raw_wrap).strip().lower() in ("true", "是", "yes")
+    for s in STRATEGY_ORDER:
+        if s in strategy:
+            strategy = s
+            break
+    else:
+        strategy = ""
+    if wrap:
+        strategy = "回顾看"
+    return strategy, wrap
+
+
+# 判定调用失败时的保守兜底：只有出现这些明确话术才认定收尾，避免误判提前收摊
+WRAPUP_HINTS = ("这组问题到这儿", "聊到这儿", "这组聊完", "已经聊完", "咱们就到这",
+                "就聊到这儿", "这组问题就到这里", "本组聊完")
+
+
+def looks_like_wrapup(text):
+    return any(k in (text or "") for k in WRAPUP_HINTS)
+
+
+# ---- 收尾决策：交给独立判定，不指望生成模型自己“收摊” ----
+# 实测 glm-4-flash 在生成时不肯主动收尾（一路追到第 8 轮仍在追问），即使提示词里
+# 把收尾条件写得很具体。而“判定该不该收尾”是个比“边写边做元决策”简单得多的任务，
+# 独立调用可靠得多。因此：判定说该收 → 后端强制走收尾生成。
+JUDGE_WRAP_SYSTEM = (
+    "你是教学对话分析助手。判断一段苏格拉底式追问对话是否到了该收尾的时候。"
+    "只输出一个 JSON 对象（json），不要输出任何解释文字，也不要用代码块包裹。"
+)
+
+JUDGE_WRAP_TEMPLATE = """这是一段高中议论文写作陪练对话。AI 扮演“只问不答”的追问者：每次针对学生论证里最没说清的一处发问，学生作答后继续追问；当学生把被追问的地方说明白了，AI 就该收尾（替他梳理这组讨论、请他回看），不再追问。
+
+【最近几轮对话】
+{dialogue}
+
+学生到现在一共作答了 {turns} 次。
+
+请判断：**现在这一回合就应该收尾吗？**
+
+判断标准很严：**学生只是重申自己的观点、只是给某个词下定义、只是又举了一个例子，而始终没解释“为什么”，一律算没补上，不能收尾。**
+
+只有满足下面任意一条，才判该收尾：
+- 学生针对 AI 上一轮问的那个点，说出了具体的理由或机制（出现了“因为……”“原因是……”“它之所以……是因为”这类解释）；
+- 学生想到了有人会怎么反对他，或什么条件下他的说法不成立；
+- 学生出现了自我修正（如“我明白了”“原来我搞混了”“如果重写我会……”）；
+- AI 已经把同一个点追问了两次以上，学生仍在含糊逃避，再追也问不出新东西。
+
+注意：学生作答次数少于 3 次时，一律判 false（一组追问至少要覆盖两三个断裂点才有意义）。
+
+输出格式：{{"wrap": false, "reason": "一句话理由"}}"""
+
+# 收尾的硬下限：学生作答不足这个次数，绝不收尾。
+# 这不是“追问上限”（不是到点就收），而是“最少要问够几个来回”，
+# 避免判定过宽、学生答一轮就被收掉。
+MIN_TURNS_BEFORE_WRAP = 3
+
+
+def judge_wrap(dialogue_tail, turns):
+    """判断本组对话这一回合是否该收尾。判定失败返回 False（宁可继续追问，不误收）。"""
+    if not ZHIPU_API_KEY or not dialogue_tail:
+        return False
+    if turns < MIN_TURNS_BEFORE_WRAP:
+        return False
+    prompt = JUDGE_WRAP_TEMPLATE.format(dialogue=dialogue_tail, turns=turns)
+    try:
+        raw = call_zhipu(JUDGE_WRAP_SYSTEM, [("user", prompt)], json_mode=True)
+    except Exception:
+        return False
+    obj = parse_json_obj(raw)
+    if not obj:
+        return False
+    w = obj.get("wrap")
+    if isinstance(w, bool):
+        return w
+    return str(w).strip().lower() in ("true", "是", "yes")
+
+
+
 DEMO_STRATEGY_CYCLE = STRATEGY_ORDER
 
 
-def demo_respond(stage, history, last_user, round_num=1):
-    """无 API key 时的演示应答，保证界面可跑通流程。"""
+def demo_respond(stage, history, last_user, round_num=1, is_opening=False, wrap_mode=""):
+    """无 API key 时的演示应答，保证界面可跑通流程。
+
+    注意 is_opening：跨轮次历史里带着上一轮的若干条 user 消息，如果不区分“这是本轮开场”，
+    第2轮开场会被误判成“已经聊了好几轮”而直接收尾。
+    """
     if stage == 1:
-        turn = max(0, len([h for h in history if h[0] == "user"]))
-        # 演示模式：第3个来回后走一遍收尾（真实模式由模型判断断裂点是否补完，无固定轮数）
-        if turn >= 3:
+        if wrap_mode in ("now", "after") or (not is_opening and not wrap_mode and
+                                             len([h for h in history if h[0] == "user"]) >= 3):
             return ("（演示模式·收尾）咱们这组问题聊到这儿。回头看一下：你一开始给的是一个比较"
                     "笼统的说法，中间我追着问了两轮，你才把「你的例子到底是怎么支持观点」这一层"
                     "讲清楚；反方会怎么说，你后来也想到了。现在你觉得自己的论证哪一部分变结实了？"
-                    "如果重写这篇作文，你会改哪里？\n\n【策略：回顾看】")
+                    "如果重写这篇作文，你会改哪里？\n\n@@策略=回顾看@@\n@@收尾=是@@")
         # 阶段一策略全开，演示模式按序轮换
         from prompts import ROUND_POOL
         pool = ROUND_POOL.get(round_num, ROUND_POOL[1])
+        turn = 0 if is_opening else len([h for h in history if h[0] == "user"])
         strat = pool[turn % len(pool)]
         q = {
             "退一步": "你提到的这个观点里，核心概念具体指什么？换一种说法你会怎么界定它？",
@@ -230,55 +483,72 @@ def demo_respond(stage, history, last_user, round_num=1):
             "进一步": "如果这个观点成立，会带来哪些更深层的后果或启示？",
             "回顾看": "回顾我们刚才的对话，你觉得自己的论证哪一部分变扎实了？重写会改哪里？",
         }[strat]
-        return q + f"\n\n【策略：{strat}】"
+        return q + f"\n\n@@策略={strat}@@\n@@收尾=否@@"
     else:
         strat = "回顾看"
         m = re.search(r"\[学生使用策略：(.+?)\]", last_user or "")
         if m:
             strat = m.group(1).strip()
         return (f"（演示模式·逻辑顾问）我收到你用「{strat}」策略的提问了。"
-                f"你能先自己说说：按这个角度，你现在的论证哪里还站不稳吗？\n\n【引导：{strat}】")
+                f"你能先自己说说：按这个角度，你现在的论证哪里还站不稳吗？\n\n@@策略={strat}@@\n@@收尾=否@@")
 
 
-def generate_assistant(stage, history, last_user="", essay="", round_num=1, prev_essay=""):
-    """返回 (text, strategy)。
-    prev_essay：第2轮时传入该生第1轮的原稿，用于"对照升格稿再诊断"。"""
+def generate_assistant(stage, history, last_user="", essay="", round_num=1, prev_essay="",
+                       wrap_mode="", is_opening=False):
+    """返回 (给学生的正文, 引导策略, 是否该收尾)。
+    prev_essay：第2轮时传入该生第1轮的原稿，用于"对照升格稿再诊断"。
+    wrap_mode："" 正常追问 / "now" 这一回合收尾 / "after" 收尾后学生又多说的。
+    is_opening：是否为本轮第一次追问（开场），此时不能说"针对他刚才那句"。"""
+    api_history = list(history)
     if stage == 1:
         system_prompt = build_stage1_system(round_num, prev_essay)
         if essay and essay.strip():
-            # 本轮作文作为最后一条 user 消息交给模型：
-            #   · 第1轮无历史时，等于“基于作文开问”；
-            #   · 第2轮起 history 非空，模型既能看到上一轮追问过什么，
-            #     也能读到本轮新提交的稿子（不能因为 history 非空就丢掉本轮作文）
             if round_num == 2 and prev_essay and prev_essay.strip():
                 intro = (
                     "【学生本轮提交的升格稿】\n" + essay.strip()
                     + "\n这是他在第1轮对话之后自己改出来的稿子。请对照上面附的第1轮原稿，"
                       "先判断上一轮追的那个断裂点补上了没有，再针对**仍然没补上（或新出现）**"
-                      "的最突出断裂点，抛出本轮的第一个追问。第一句话就是问题本身，"
-                      "不要先分析、不要列诊断清单、不要评价他有没有进步。"
+                      "的最突出断裂点，抛出本轮的第一个追问。"
                 )
             else:
                 intro = (
-                    "【学生本轮提交的作文】\n" + essay.strip()
-                    + "\n请直接基于这篇作文，按你的优先顺序找出最突出的断裂点，抛出一个具体的"
-                      "追问问题作为本轮第一次追问。第一句话就是问题本身，不要先分析、不要列诊断清单。"
+                    "【学生本轮提交的作文（本轮讨论的文本，以它为准）】\n" + essay.strip()
                 )
-            api_history = history + [("user", intro)]
-        else:
-            api_history = history
+            # 作文是**背景材料**，必须放在对话历史之前。
+            # 踩过的坑：放在末尾时，模型会把「他最后这一句」误认成作文的末句，
+            # 于是连续好几轮都在追问作文结尾的同一句话。
+            api_history = [("user", intro)] + api_history
     else:
         system_prompt = STAGE2_SYSTEM
-        api_history = history
+    # 本回合是这一组里的第几次追问（开场算第 0 次）——告诉模型轮数，它才收得住尾
+    turn_no = len([1 for r, _ in history if r == "assistant"]) + 1
+    # 关键：把当回合的即时指令放在对话最末尾（就近约束）
+    api_history = api_history + [("user", build_turn_nudge(stage, is_opening, last_user,
+                                                           wrap_mode, turn_no))]
+    # 1) 正文：纯文本生成（不要求模型附带标注——实测它会漏、且会污染正文风格）
+    text = ""
     if ZHIPU_API_KEY:
         try:
-            raw = call_zhipu(system_prompt, api_history)
-            return parse_strategy_tag(raw)
+            text = call_zhipu(system_prompt, api_history)
         except Exception:
-            raw = demo_respond(stage, history, last_user, round_num)
-            return parse_strategy_tag(raw)
-    raw = demo_respond(stage, history, last_user, round_num)
-    return parse_strategy_tag(raw)
+            text = ""
+    if not text:
+        raw = demo_respond(stage, history, last_user, round_num, is_opening, wrap_mode)
+        return parse_meta(raw)
+    # 万一模型自己附了标注（旧格式），先剥掉，确保不泄漏到学生端
+    text, leaked_strategy, leaked_wrap = parse_meta(text)
+    # 收尾由后端判定驱动：这一回合就是收尾回合，策略固定记「回顾看」
+    if wrap_mode in ("now", "after"):
+        return text, "回顾看", True
+    # 研究字段：独立判定本回合的引导策略与是否收尾
+    strategy, judged_wrap = judge_turn(last_user, text)
+    if not strategy and leaked_strategy:
+        strategy = leaked_strategy
+    wrap = bool(judged_wrap or leaked_wrap)
+    # 判定失败时的保守兜底：正文里出现了明确的收尾话术，才认定已收尾
+    if not wrap and not strategy and looks_like_wrapup(text):
+        wrap, strategy = True, "回顾看"
+    return text, strategy, wrap
 
 
 def ensure_round_conversation(student_id, essay=""):
@@ -317,9 +587,10 @@ def ensure_round_conversation(student_id, essay=""):
         (student_id,)).fetchall()
     history_ctx = [(r["role"], r["content"]) for r in hist_rows]
     if stage == 1:
-        opening, strategy = generate_assistant(1, history_ctx, essay=base_essay,
-                                               round_num=round_num,
-                                               prev_essay=prev_essay)
+        opening, strategy, _ = generate_assistant(1, history_ctx, essay=base_essay,
+                                                  round_num=round_num,
+                                                  prev_essay=prev_essay,
+                                                  is_opening=True)
     else:
         opening = STAGE2_OPENING
         strategy = "回顾看"
@@ -476,16 +747,28 @@ def chat():
     conn.execute(
         "INSERT INTO messages(conversation_id, role, content, strategy, created_at) VALUES(?,?,?,?,?)",
         (conv_id, "user", user_text, strategy_used, now_str()))
+    # 收尾决策：交给独立判定（实测生成模型自己不肯收尾，会一路追问下去）。
+    # 判定输入＝本轮最近几条对话 + 学生这一次的回应 + 他累计作答次数。
+    wrap_mode = "after" if already_wrapped else ""
+    if stage == 1 and not already_wrapped:
+        tail = "\n".join(
+            ("AI：" if r["role"] == "assistant" else "学生：") + (r["content"] or "")[:220]
+            for r in rows[-4:])
+        tail += "\n学生：" + user_text[:220]
+        turns = len([r for r in rows if r["role"] == "user"]) + 1
+        if judge_wrap(tail, turns):
+            wrap_mode = "now"
     # 生成 AI 回复
-    text, strategy = generate_assistant(stage, history, raw_user, essay, round_num,
-                                        prev_essay)
+    text, strategy, should_wrap = generate_assistant(stage, history, raw_user, essay,
+                                                    round_num, prev_essay,
+                                                    wrap_mode)
     conn.execute(
         "INSERT INTO messages(conversation_id, role, content, strategy, created_at) VALUES(?,?,?,?,?)",
         (conv_id, "assistant", text, strategy, now_str()))
     conn.commit()
     conn.close()
-    # 收尾状态：模型以「回顾看」收尾、或此前已收尾
-    wrapped = (strategy == "回顾看" or already_wrapped)
+    # 收尾状态：模型判定该收尾（末尾标注 @@收尾=是@@）、或此前已收尾
+    wrapped = bool(should_wrap or already_wrapped or strategy == "回顾看")
     return jsonify({"reply": text, "strategy": strategy, "wrapped": wrapped})
 
 

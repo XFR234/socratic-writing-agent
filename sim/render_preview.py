@@ -63,7 +63,9 @@ checks = [
     ("旧写法「（选填）」label 已清掉", "学号（选填）" not in html),
     ("旧写法「（<b>必填</b>）」已清掉", "（<b>必填</b>）" not in html),
     ("两个按钮各带需求清单", html.count('class="req-note"') == 2),
-    ("分组徽标齐全", html.count('badge badge-both') == 1 and html.count('badge badge-chat') == 1),
+    ("「只有「开始对话」要填」徽标保留", html.count('badge badge-chat') == 1),
+    ("「两个按钮都要填」徽标已删", "两个按钮都要填" not in html),
+    ("第②项下方那段提示语已删", "题目里往往藏着" not in html),
     ("悬停高亮函数已注入", "function hlFields(" in html),
     ("缺失字段定位函数已注入", "function focusField(" in html),
 ]

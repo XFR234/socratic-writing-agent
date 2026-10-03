@@ -44,7 +44,6 @@
   .group-head { display:flex; align-items:center; gap:7px; flex-wrap:wrap; padding:10px 0 0; }
   .group-title { font-size:13.5px; font-weight:600; color:#8a6a2a; }
   .badge { font-size:11px; padding:2px 9px; border-radius:999px; white-space:nowrap; line-height:1.6; }
-  .badge-both   { background:#fdf0da; color:#9a6a20; border:1px solid #eed9b0; }
   .badge-chat   { background:#eef3f6; color:#4a6b7c; border:1px solid #d8e4ea; }
   .badge-prompt { background:#eef4fb; color:#3b6fd4; border:1px solid #d7e6f5; }
   .badge-optional { background:#f2efe8; color:#9a8a64; border:1px solid #e6e0d2; }
@@ -160,15 +159,11 @@
 
       <!-- ② 题目与材料：两个入口都需要 -->
       <div id="topicBox" class="field-group">
-        <div class="group-head">
-          <span class="group-title">② 这道题</span>
-          <span class="badge badge-both">两个按钮都要填</span>
-        </div>
+        <div class="group-head"><span class="group-title">② 这道题</span></div>
         <div class="label-row"><label for="topic">作文题目 <b class="star">*</b></label></div>
         <input id="topic" placeholder="例如：学以成人">
         <div class="label-row"><label for="material">材料／写作要求 <b class="star">*</b></label></div>
         <textarea id="material" style="min-height:70px" placeholder="把题目下面的材料、写作要求或者提示语贴上来。苏格拉底要靠它才知道你这篇该不该扣题、你把题目里的关键词读准了没有。"></textarea>
-        <div class="hint">题目里往往藏着两三个关键词（比如"学以成人"里的"学"和"成人"），绝大多数同学的问题不是跑题，而是把它们读窄了——只有他看见题目和材料，才挑得出这个问题。</div>
       </div>
 
       <!-- ③ 作文：只有「开始对话」需要 -->

@@ -268,16 +268,31 @@ DATA = [
 OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                    "data", "textbook_index.json")
 
+# 只收学生在高二已学完的册次。
+# 【2026-10-03 许总定】暂时不含"选必中"——学生高二上刚接触这册，
+# 素材引用容易超出他们实际学过的范围（说"你学过的《过秦论》"而他还没上，
+# 会被当成编造）。等这册上完，把下面的 EXCLUDE_BOOKS 清掉即可。
+EXCLUDE_BOOKS = ("选必中",)
+
+
+def keep(book):
+    return not any(b in book for b in EXCLUDE_BOOKS)
+
 if __name__ == "__main__":
     index = []
+    skipped = 0
     for t, bk, core, mat, quotes, topics in DATA:
+        if not keep(bk):
+            skipped += 1
+            continue
         index.append({
             "篇目": t, "册次": bk, "核心思想": core,
             "素材点": mat, "名句": quotes, "适用话题": topics,
         })
     with open(OUT, "w", encoding="utf-8") as f:
         json.dump(index, f, ensure_ascii=False, indent=1)
-    print("已写入 %d 篇：%s" % (len(index), OUT))
+    note = ("（已排除 %d 篇：%s）" % (skipped, "、".join(EXCLUDE_BOOKS))) if skipped else ""
+    print("已写入 %d 篇%s：%s" % (len(index), note, OUT))
     # 自检：任何英文字母混入中文栏位都算硬伤（这份是直接喂给 AI 的语料）
     import re
     bad = []

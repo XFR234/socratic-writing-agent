@@ -45,6 +45,14 @@ def log(entry):
         f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
 
+# 固定的题面：题目与材料自 2026-10-03 起必填，本地模拟跟着填一份，
+# 这样「关键词解读偏差」这一诊断在模拟里也能被跑到。
+SIM_TOPIC = "学以成人"
+SIM_MATERIAL = ("材料：一个人从出生到成人，成长中离不开学习。"
+                "有人以为学知识就够了，其实还要学做人、学会分辨是非。"
+                "学了却做错，知识越多错得越远。")
+
+
 def make_client(st):
     c = app.test_client()
     if st.get("student_id"):
@@ -60,7 +68,9 @@ def do_start(essay_path):
         essay = f.read().strip()
     name = "模拟学生A"
     c = app.test_client()
-    r = c.post("/start", data={"name": name, "sid": "SIM01", "essay": essay})
+    # 题目与材料必填（2026-10-03 起），这里跟着填一份固定的题面
+    r = c.post("/start", data={"name": name, "sid": "SIM01", "essay": essay,
+                              "topic": SIM_TOPIC, "material": SIM_MATERIAL})
     data = r.get_json()
     if not data or not data.get("ok"):
         print("START FAILED:", r.status_code, data)

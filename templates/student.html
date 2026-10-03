@@ -133,11 +133,11 @@
       <label>学号（选填）</label>
       <input id="sid" placeholder="选填">
       <div id="topicBox">
-        <label>作文题目（<b>建议填</b>）</label>
+        <label>作文题目 <b style="color:#b23a2e">*</b></label>
         <input id="topic" placeholder="例如：学以成人">
-        <label>材料／写作要求（<b>选填</b>，有就贴上）</label>
-        <textarea id="material" style="min-height:70px" placeholder="把题目下面的材料、写作要求或者提示语贴上来。填了之后，苏格拉底知道你审的是哪道题，能看出你有没有跑题。"></textarea>
-        <div class="hint">这两项不填也能开始，但填了以后追问会更扣题——你写的东西离题太远时，它能指出来。</div>
+        <label>材料／写作要求 <b style="color:#b23a2e">*</b></label>
+        <textarea id="material" style="min-height:70px" placeholder="把题目下面的材料、写作要求或者提示语贴上来。填了之后，苏格拉底才知道你这篇该不该扣题、你把题目里的关键词读准了没有。"></textarea>
+        <div class="hint">这两项<b>都要填</b>。题目里往往藏着两三个关键词（比如"学以成人"里的"学"和"成人"），绝大多数同学的问题不是跑题，而是把它们读窄了——只有他看见题目，才挑得出这个问题。</div>
       </div>
       <div id="essayBox">
         {% if draft_type == '升格稿' %}
@@ -157,10 +157,10 @@
       </div>
       <div id="promptBox" class="form hidden" style="margin-top:14px;padding:14px;border:1px dashed #d9c9a3;border-radius:8px">
         <div class="hint" style="margin-bottom:10px">审题阶段只做一件事：把题目的核心概念说准。不用写作文，也不会有标准答案给你。</div>
-        <label>作文题目 *</label>
+        <label>作文题目 <b style="color:#b23a2e">*</b></label>
         <input id="p_topic" placeholder="例如：学以成人">
-        <label>材料／写作要求（选填）</label>
-        <textarea id="p_material" style="min-height:70px" placeholder="把材料贴上来（没有也可以，只给题目也行）"></textarea>
+        <label>材料／写作要求 <b style="color:#b23a2e">*</b></label>
+        <textarea id="p_material" style="min-height:70px" placeholder="把材料贴上来。只有题目四个字没法审——审题要看的正是材料里有什么矛盾、困境、不合理的地方。"></textarea>
         <label>你自己的初步想法（选填）</label>
         <textarea id="p_idea" style="min-height:60px" placeholder="你觉得这道题在问什么？先随便写，苏格拉底会抓着你的理解追问。"></textarea>
         <div style="margin-top:12px">
@@ -308,6 +308,19 @@ function startChat() {
   const essay = document.getElementById('essay').value.trim();
   const topic = document.getElementById('topic') ? document.getElementById('topic').value.trim() : '';
   const material = document.getElementById('material') ? document.getElementById('material').value.trim() : '';
+  // 题目与材料必填（许总 10-03 定）：两个入口各自把材料交齐。
+  // 理由对学生要说清，别只说"必填"——不然他随便敲四个字就完事。
+  if (!topic) {
+    alert('请先填作文题目。\n'
+        + '题目里通常藏着一两个关键词（比如“学以成人”里的“学”和“成人”），'
+        + '苏格拉底要靠它判断你有没有把这些词读准。');
+    return;
+  }
+  if (!material) {
+    alert('请把题目的材料／写作要求贴上来。\n'
+        + '没有材料，他只能从你的作文里猜这题要写什么，猜不准就追错方向。');
+    return;
+  }
   if (essay.length < MIN_ESSAY_LEN) {
     alert('请粘贴完整的作文（不少于 ' + MIN_ESSAY_LEN + ' 字）。\n'
         + '只写一句观点不够——AI 要读完整篇，才能找到你论证里的问题。');
@@ -355,8 +368,14 @@ function startPrompt() {
   const name = document.getElementById('name').value.trim();
   if (!name) { alert('请先填写姓名'); return; }
   const topic = document.getElementById('p_topic').value.trim();
-  if (!topic) { alert('请填写作文题目'); return; }
+  if (!topic) { alert('请填写作文题目——审题得先有题目'); return; }
   const material = document.getElementById('p_material').value.trim();
+  if (!material) {
+    alert('请把题目的材料／写作要求贴上来。\n'
+        + '审题要看的正是材料里有什么矛盾、困境、不合理的地方，'
+        + '只有题目四个字没法审。');
+    return;
+  }
   const idea = document.getElementById('p_idea').value.trim();
   const box = document.getElementById('p_chat');
   box.classList.remove('hidden');

@@ -494,8 +494,14 @@ def build_turn_nudge(stage, is_opening=False, last_user="", wrap_mode="", turn_n
                  + "\n".join("· " + q for q in prev_questions) + "\n")
     focus = ""
     if next_point and next_point in POINT_DESC:
-        focus = ("**这一轮只盯住这一个断裂点——" + next_point + "**："
-                 + POINT_DESC[next_point] + "\n")
+        focus = ("**这一轮只盯住这一个断裂点——" + next_point + "**：" + POINT_DESC[next_point] + "\n")
+        if next_point == "关键词解读偏差":
+            # 这一处最容易被带偏：模型会顺手去追作文里第一个抓眼的比喻或例子，
+            # 实测它开口就问"地基指什么"——而那属于另外五个断裂点。
+            # 题目里明明有两三个关键词，一个字都没问，追问就白费了。
+            focus += ("**硬要求：这一句必须问题目里的关键词，不能问作文里的话。**"
+                      "不要引用他作文里的比喻、例子、名言去追问——"
+                      "先问题目那个词在这个题目里指什么。\n")
         if point_repeat:
             # 第二次追同一个点：光说“换个角度”它做不到，得把“不许怎么问”点明
             focus += ("这个点你上一轮已经问过一次了（问句见上），他没答到你要的层次。"
@@ -518,7 +524,8 @@ def build_turn_nudge(stage, is_opening=False, last_user="", wrap_mode="", turn_n
     if is_opening:
         return (
             "（这是本轮的第一个追问。请基于上面【学生本轮提交的作文】写你这回合的回复：\n"
-            + asked +
+            + focus +
+            asked +
             "1. 第一句话就是你的问题本身，只问一个问题，不要连续甩好几个问题。\n"
             "2. 不许先分析、不要列“诊断清单”、不要评价他的作文；不要用“你的作文很有意思”"
             "这类寒暄。要点名他作文里的哪句话时，直接把原句引出来就行，不要写“你提到”三个字。\n"
@@ -713,7 +720,11 @@ JUDGE_POINT_TEMPLATE = """这是一篇高中议论文，和围绕它已经发生
 {dialogue}
 
 {asked}
-六个断裂点（next 只能从这六个词里选一个原样填）：
+{topic_block}七个断裂点（next 只能从这七个词里选一个原样填）：
+- 关键词解读偏差：**他对题目里关键词的理解偏了**——不是跑题，是解读不到位。
+  典型：题目"学以成人"，他把"成人"理解成生理成熟，题目要的是学问+人格；
+  题目"功用"，他理解成"有用"，材料讲的是不可替代的价值。
+  **如果他作文的核心词跟材料里说的不是一回事，就是这个点。**
 - 主张模糊：他核心的那句话本身就含糊，关键词含义不清、主张范围不明；
 - 担保断裂：他摆了例子或名言，但说不上这些材料凭什么能支持他的观点；
 - 支撑薄弱：他的理由背后缺少更根本的依据，或者只孤零零举了一个例子；
@@ -724,7 +735,7 @@ JUDGE_POINT_TEMPLATE = """这是一篇高中议论文，和围绕它已经发生
 请判断两点：
 1. covered —— 学生**已经在回答里用自己的话说清楚**的断裂点（他给出了解释、让步或反例就算，哪怕不完美；只是重申观点、只是给词下定义、只是又举一个例子，不算）。
 2. next —— **这一轮最该追的那一个**断裂点。不要选 covered 里的，**也不要再选前几轮已经反复追过的**——同一个点追两轮他还答不上来，就换下一个点，别原地打转。
-
+{kw_rule}
 输出格式：{{"covered": ["担保断裂"], "next": "限定缺失"}}"""
 
 
@@ -789,23 +800,60 @@ def judge_wrap(dialogue_tail, turns):
     return str(w).strip().lower() in ("true", "是", "yes")
 
 
-def judge_point(essay, dialogue, asked_points=None):
+def judge_point(essay, dialogue, asked_points=None, topic="", material="",
+                first_round=False):
     """判定这一轮该追哪个断裂点。返回 POINT_ORDER 里的一个词，失败返回 ""。
 
     asked_points：前面几轮已经追过的断裂点。必须告诉它，否则它会在同一个点上
-    反复选（实测：学生答完“限定缺失”，它还接着选“限定缺失”，追问原地绕）。
-    返回“元认知反思缺失”时，同时意味着该收尾（见 /chat 里的处理）。
+    反复选（实测：学生答完"限定缺失"，它还接着选"限定缺失"，追问原地绕）。
+
+    topic/material：作文题目与材料。**2026-10-03 加**——之前这个函数只拿到作文
+    和对话历史，压根不知道题目要求什么，所以"学生对题目关键词的理解偏了"
+    这类问题永远不会被判出来。题目是"学以成人"、学生把"成人"理解成生理成熟，
+    工具却一路在追"例子凭什么支持观点"——**追得越勤，偏得越远**。
+
+    first_round：本轮是不是这一组的第一次追问。关键词解读偏差**只在第一次
+    有意义**（一旦开始追论证，就回不去了），所以只在第一轮参与判定。
+
+    返回"元认知反思缺失"时，同时意味着该收尾（见 /chat 里的处理）。
     """
-    if not ZHIPU_API_KEY or not dialogue:
+    # 注意：dialogue 为空**不能**直接返回""——开场那一句还没有对话记录，
+    # 实测那样会让开场的 point 恒为 None，「关键词解读偏差」永远出不来
+    # （AI 于是直接去追"立德指什么"，而真正该问的是"学"和"成人"读准没）。
+    if not ZHIPU_API_KEY or not essay:
         return ""
     asked = "、".join([p for p in (asked_points or []) if p])
+    # 题面块：没有题目就不给——**不猜**。猜出来的题意不可靠，还会污染数据
+    # （许总 2026-10-03 定：学生没填题目就跳过这个诊断，只做原来六项）。
+    topic_block = ""
+    kw_rule = ""
+    if topic and topic.strip():
+        topic_block = "【这道作文题的题目】" + topic.strip() + "\n"
+        if material and material.strip():
+            topic_block += "【题目下的材料／写作要求】\n" + material.strip() + "\n"
+        topic_block += "\n"
+        if first_round:
+            kw_rule = ("**这一轮是第一次追问**：先判断他对题目关键词的理解对不对——"
+                       "如果他作文里那个核心词的意思跟题目／材料里说的不是一回事，"
+                       "就选「关键词解读偏差」（这个点必须在第一次追，"
+                       "一旦开始追论证就回不去了）。理解没问题才选其他六个。\n")
+        else:
+            kw_rule = ("关键词解读偏差只在第一次追问时判；这一轮不要选它。\n")
+    else:
+        kw_rule = ("【注意】学生没有填题目，你不知道他要写什么。"
+                   "**不要**猜题目、**不要**选「关键词解读偏差」——"
+                   "只在他写出来的论证内部判断。\n")
     prompt = JUDGE_POINT_TEMPLATE.format(
         essay=(essay or "")[:1200],
         asked=("【前面几轮已经追过的断裂点】" + asked + "\n"
                "（这些点他要是在回答里已经给了自己的说法，就算补上了；"
                "但别因为它们被追过就当它们补上了——还是要看他到底说清楚没有。"
                "没补上的话可以再追，但要换个更小的切口。）\n") if asked else "",
-        dialogue=dialogue[:2000])
+        topic_block=topic_block,
+        kw_rule=kw_rule,
+        dialogue=("（这是这一组追问的第一句，之前还没有对话。）\n" + dialogue[:2000]
+                  if not (dialogue or "").strip()
+                  else dialogue[:2000]))
     try:
         raw = call_zhipu(JUDGE_POINT_SYSTEM, [("user", prompt)],
                          json_mode=True, temperature=0)
@@ -817,6 +865,9 @@ def judge_point(essay, dialogue, asked_points=None):
     nxt = str(obj.get("next") or "").strip()
     for p in POINT_ORDER:
         if p in nxt:
+            # 没题目、或者不是第一轮，关键词解读偏差一律不算
+            if p == "关键词解读偏差" and not (topic and topic.strip() and first_round):
+                continue
             return p
     return ""
 
@@ -1438,18 +1489,30 @@ def ensure_round_conversation(student_id, essay="", topic="", material=""):
         "ON c.id=m.conversation_id WHERE c.student_id=? ORDER BY m.id",
         (student_id,)).fetchall()
     history_ctx = [(r["role"], r["content"]) for r in hist_rows]
+    open_point = ""
     if stage == 1:
+        # 开场这一句也要先判断裂点：不然「关键词解读偏差」永远出不来
+        # （实测：开场走的是 is_opening 分支，不判定，point 恒为 None，
+        #  AI 就会直接去追"立德具体指什么"，而真正该问的是"学"和"成人"读准没）。
+        open_point = ""
+        try:
+            open_point = judge_point(base_essay, "", [],
+                                     topic, material, first_round=True)
+        except Exception:
+            open_point = ""
         opening, strategy, _ = generate_assistant(1, history_ctx, essay=base_essay,
                                                   round_num=round_num,
                                                   prev_essay=prev_essay,
                                                   is_opening=True,
-                                                  topic=topic, material=material)
+                                                  topic=topic, material=material,
+                                                  next_point=open_point)
     else:
         opening = STAGE2_OPENING
         strategy = "回顾看"
     conn.execute(
-        "INSERT INTO messages(conversation_id, role, content, strategy, created_at) VALUES(?,?,?,?,?)",
-        (conv_id, "assistant", opening, strategy, now_str()))
+        "INSERT INTO messages(conversation_id, role, content, strategy, point, created_at) "
+        "VALUES(?,?,?,?,?,?)",
+        (conv_id, "assistant", opening, strategy, open_point or None, now_str()))
     conn.commit()
     conn.close()
     return conv_id, base_essay
@@ -1507,6 +1570,18 @@ def start():
     material = (request.form.get("material") or "").strip()  # 材料／写作要求
     if not name:
         return jsonify({"error": "请填写姓名"}), 400
+    # 【2026-10-03 许总定】两个入口各自把材料交齐：
+    # 点"开始对话"＝作文入口 → 必须有题目（诊断"解读不到位"的前提）＋作文；
+    # 点"先做审题" ＝审题入口 → 必须有题目（/start_prompt 已校验）。
+    # 为什么题目必填：断裂点判定要看题面才知道学生有没有读准关键词，
+    # 没题面时它只能跳过这个诊断（不猜，猜出来的题意会污染数据）。
+    if not topic:
+        return jsonify({"error": "请填写作文题目——苏格拉底要靠题目才知道"
+                                 "你这篇该不该扣题、你把关键词读准了没有。"}), 400
+    if not material:
+        return jsonify({"error": "请把题目的材料／写作要求贴上来"
+                                 "（没有材料就贴写作要求）。"
+                                 "有题面他才能判断你写的东西回应的是不是题目真正问的那件事。"}), 400
     conn = get_db()
     # 同名复用学生记录
     stu = conn.execute("SELECT id FROM students WHERE name=?", (name,)).fetchone()
@@ -1566,6 +1641,12 @@ def start_prompt():
         return jsonify({"error": "请填写姓名"}), 400
     if not topic:
         return jsonify({"error": "请填写作文题目——审题得先有题目"}), 400
+    # 审题入口也要求材料（许总 2026-10-03 定：两个入口各自把材料交齐）。
+    # 审题最要紧的就是"题目在回应什么困境"，只看题目没有材料，等于凭空猜。
+    if not material:
+        return jsonify({"error": "请把题目的材料／写作要求贴上来——"
+                                 "审题要看的正是材料里有什么矛盾、困境，"
+                                 "只有题目四个字没法审。"}), 400
     conn = get_db()
     stu = conn.execute("SELECT id FROM students WHERE name=?", (name,)).fetchone()
     if stu:
@@ -1728,7 +1809,9 @@ def chat():
         # 的问题难度，不是整个对话的难度）。
         turns = len([r for r in rows if r["role"] == "user"]) + 1
         asked_points = [r["point"] for r in rows if r["point"]]
-        next_point = judge_point(essay, tail, asked_points)
+        # 求助回合不是"第一次追问"，关键词解读偏差不参与
+        next_point = judge_point(essay, tail, asked_points, topic, material,
+                                first_round=False)
         if next_point == "元认知反思缺失":
             next_point = asked_points[-1] if asked_points else ""
         wrap_mode = ""
@@ -1749,12 +1832,22 @@ def chat():
         # 已经追过哪些断裂点（内部推进用，不参与研究编码）
         asked_points = [r["point"] for r in rows if r["point"]]
         # 一次判定办两件事：这一轮追哪个断裂点 + 是否六个点都补上了（→ 该收尾）
-        next_point = judge_point(essay, tail, asked_points)
+        # first_round：有没有 AI 说过话（开场那一条不算"学生答过一次"）
+        ai_told = any(r["role"] == "assistant" and r["content"] for r in rows)
+        next_point = judge_point(essay, tail, asked_points, topic, material,
+                                first_round=not ai_told)
         # 同一个断裂点最多追两轮。判定要是还想追第三轮，强制换一个没追过的点；
-        # 都追遍了就收尾。这不是“追问上限”（不是到点就收），而是不让它在同一处反复磨——
+        # 都追遍了就收尾。这不是"追问上限"（不是到点就收），而是不让它在同一处反复磨——
         # 实测判定会连选同一处（学生已经举了例子，它还接着要例子），追问原地打转。
         if next_point in ("", "元认知反思缺失"):
             pass
+        elif next_point == "关键词解读偏差" and asked_points.count(next_point) >= 1:
+            # 这个点只在第一次有效，第二次就不该再追了——强制换点
+            for p in POINT_ORDER:
+                if p in ("元认知反思缺失", "关键词解读偏差") or p in asked_points:
+                    continue
+                next_point = p
+                break
         elif asked_points.count(next_point) >= 2:
             for p in POINT_ORDER:
                 if p == "元认知反思缺失" or p in asked_points:

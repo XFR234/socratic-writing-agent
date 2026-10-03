@@ -145,7 +145,7 @@
 
   <div class="main">
     <!-- 登录/开始 -->
-    <div id="startBox" class="card form {% if logged_in %}hidden{% endif %}">
+    <div id="startBox" class="card form {% if history_messages %}hidden{% endif %}">
       <div class="req-legend">带 <b class="star">*</b> 的为必填项；没标星的可不填。</div>
 
       <!-- ① 学生信息 -->
@@ -214,7 +214,6 @@
         <div style="margin-top:12px">
           <button class="btn btn-primary" style="width:100%" onclick="startPrompt()">开始审题</button>
         </div>
-        <div id="p_chat" class="hidden" style="margin-top:14px"></div>
       </div>
       <div class="hint">对话内容会由教师从后台查看并用于研究分析。请文明交流，避开敏感话题。</div>
 
@@ -236,25 +235,45 @@
     </div>
 
     <!-- 对话 -->
-    <div id="chatBox" class="card chat-card {% if not logged_in %}hidden{% endif %}">
+    <div id="chatBox" class="card chat-card {% if not history_messages %}hidden{% endif %}">
       <div class="topbar">
-        {% if logged_in %}
-          <span class="stage-badge">第{{ round_num }}轮 · {% if stage==1 %}虚拟论敌{% else %}逻辑顾问{% endif %}{% if draft_type %}（{{ draft_type }}）{% endif %}</span>
-          {% if stage == 1 %}
-            <span id="progress" style="font-size:12px;color:#a89878;margin-left:10px">{% if wrapped %}本组对话已结束{% endif %}</span>
+        {% if logged_in or stage0 %}
+          {% if stage0 %}
+            <span class="stage-badge">审题 · 概念辨析</span>
+            <span id="progress" style="font-size:12px;color:#a89878;margin-left:10px">{% if wrapped %}审题已聊完{% endif %}</span>
+          {% else %}
+            <span class="stage-badge">第{{ round_num }}轮 · {% if stage==1 %}虚拟论敌{% else %}逻辑顾问{% endif %}{% if draft_type %}（{{ draft_type }}）{% endif %}</span>
+            {% if stage == 1 %}
+              <span id="progress" style="font-size:12px;color:#a89878;margin-left:10px">{% if wrapped %}本组对话已结束{% endif %}</span>
+            {% endif %}
           {% endif %}
           <a href="javascript:void(0)" onclick="toggleHistory()" style="font-size:12px;color:#a89878;margin-left:auto;margin-right:10px">📜 往期对话</a>
           <a href="/logout" style="font-size:12px;color:#a89878">退出</a>
         {% endif %}
       </div>
 
-      {% if logged_in %}<div class="resume">欢迎回来，{{ student_name }}。下面是之前的聊天，你接着聊就行。</div>{% endif %}
+      {% if stage0 %}
+      <div class="resume">这一步只做一件事：把题目的核心概念说准。不用写作文，也不会有标准答案给你。</div>
+      {% elif logged_in %}<div class="resume">欢迎回来，{{ student_name }}。下面是之前的聊天，你接着聊就行。</div>{% endif %}
 
       <div id="chatbox"></div>
 
       <div class="input-area">
-        <!-- 阶段一策略提示（折叠条/常驻） -->
-        {% if stage == 1 %}
+        {% if stage0 %}
+          <div class="tips-card">
+            <div class="tips-title">💡 审题这一步在做什么</div>
+            <div class="tips-body">
+              他会盯着题目和材料里的<b>关键概念</b>问你，只问不答：这个词你指什么？它跟另一个词是什么关系？
+              你说得含糊，他就往下追一层。
+              <ul>
+                <li>没有标准答案，只有你自己说清楚才算数</li>
+                <li>聊到位了他会收束，请你用三行写下自己的审题笔记</li>
+                <li>写完笔记就进入写作轮，笔记会留在这条记录里</li>
+              </ul>
+            </div>
+          </div>
+        {% elif stage == 1 %}
+          <!-- 阶段一策略提示（折叠条/常驻） -->
           <div class="tips-card">
             <div class="tips-title">💡 苏格拉底会从这些角度问你（本轮策略全开）</div>
             <div class="tips-body">
@@ -275,9 +294,7 @@
             </div>
             <div class="hint" style="margin-top:8px">卡住的时候直接说就行——它不会给你答案，但会换个小一点的问题，并且把你自己写过的句子指给你看。</div>
           </div>
-        {% endif %}
-
-        {% if stage == 2 %}
+        {% elif stage == 2 %}
           <div class="strat-title">策略卡（点一张向苏格拉底提问）</div>
           <div class="order-hint">使用建议：先用①退一步/④环顾式诊断 → 再用②跳出去/③对立面找薄弱 → 然后用⑤进一步深化 → 最后用⑥回顾看反思</div>
           <div class="strat-grid">
@@ -294,8 +311,8 @@
           </div>
         {% endif %}
 
-        <div class="input-row">
-          <input id="msg" placeholder="输入你的回答或问题…" onkeydown="if(event.key==='Enter')send()">
+        <div class="input-row" id="inputRow">
+          <input id="msg" placeholder="{% if stage0 %}说说你怎么理解这个概念（不确定也没关系）{% else %}输入你的回答或问题…{% endif %}" onkeydown="if(event.key==='Enter')send()">
           <button class="btn btn-primary" onclick="send()">发送</button>
         </div>
       </div>
@@ -305,6 +322,7 @@
 
 <script>
 const stage = {{ stage }};
+const STAGE0 = {{ 'true' if stage0 else 'false' }};   // 正处于「审题·概念辨析」这一屏
 const initialHistory = {{ history_messages|tojson }};
 const MIN_ESSAY_LEN = {{ min_essay_len }};
 const WRAPPED = {{ 'true' if wrapped else 'false' }};
@@ -346,7 +364,7 @@ if (initialHistory && initialHistory.length) {
   document.getElementById('startBox').classList.add('hidden');
   document.getElementById('chatBox').classList.remove('hidden');
   renderHistory(initialHistory);
-  if (WRAPPED) showWrapped();
+  if (WRAPPED) { STAGE0 ? showPromptFinish() : showWrapped(); }
 }
 
 // 悬停按钮时高亮它需要填的字段（手机上点按也会触发一次）
@@ -446,23 +464,6 @@ function showPromptBox() {
   if (carried) tip.classList.remove('hidden');
   box.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
 }
-function addPMsg(who, text) {
-  const box = document.getElementById('p_chat');
-  const div = document.createElement('div');
-  div.style.margin = '8px 0';
-  div.style.padding = '9px 12px';
-  div.style.borderRadius = '10px';
-  div.style.fontSize = '14px';
-  div.style.lineHeight = '1.6';
-  if (who === 'me') {
-    div.style.background = '#e8f0fe'; div.style.color = '#2c3e50'; div.style.marginLeft = '18%';
-  } else {
-    div.style.background = '#faf6ec'; div.style.color = '#3d3a33'; div.style.marginRight = '18%';
-  }
-  div.textContent = text;
-  box.appendChild(div);
-  box.scrollTop = box.scrollHeight;
-}
 function startPrompt() {
   const name = document.getElementById('name').value.trim();
   if (!name) { alert('请先填写姓名'); focusField(document.getElementById('name')); return; }
@@ -481,56 +482,35 @@ function startPrompt() {
     return;
   }
   const idea = document.getElementById('p_idea').value.trim();
-  const box = document.getElementById('p_chat');
-  box.classList.remove('hidden');
-  box.innerHTML = '<div style="color:#9aa5b1;font-size:13px">苏格拉底正在思考…</div>';
   fetch('/start_prompt', {method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'},
     body:`name=${encodeURIComponent(name)}&topic=${encodeURIComponent(topic)}&material=${encodeURIComponent(material)}&idea=${encodeURIComponent(idea)}`})
     .then(r=>r.json()).then(d=>{
-      if (d.error) { box.innerHTML = ''; alert(d.error); return; }
-      box.innerHTML = '';
-      (d.history||[]).forEach(m => addPMsg(m.role==='assistant'?'ai':'me', m.content));
-      const inp = document.createElement('input');
-      inp.id = 'p_msg';
-      inp.placeholder = '说说你怎么理解这个概念（不确定也没关系）';
-      inp.style.cssText = 'width:100%;padding:9px 12px;border:1px solid #d9c9a3;border-radius:8px;margin-top:10px;box-sizing:border-box;';
-      const btn = document.createElement('button');
-      btn.className = 'btn btn-primary'; btn.textContent = '发送';
-      btn.style.marginTop = '8px';
-      btn.onclick = promptSend;
-      const wrap = document.createElement('div');
-      wrap.appendChild(inp); wrap.appendChild(btn);
-      box.appendChild(wrap);
-      inp.focus();
-      inp.addEventListener('keydown', e => { if (e.key === 'Enter') promptSend(); });
+      if (d.error) { alert(d.error); return; }
+      // 服务端已记下"审题进行中"，重载一次即进入审题那一屏。
+      // 不在前端自己拼一套审题界面——界面状态只认服务端这一份，否则两套渲染迟早不同步。
+      location.reload();
     });
 }
-function promptSend() {
-  const inp = document.getElementById('p_msg');
-  const text = inp.value.trim();
-  if (!text) return;
-  addPMsg('me', text);
-  inp.value = '';
-  fetch('/chat', {method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'},
-    body:`message=${encodeURIComponent(text)}`})
-    .then(r=>r.json()).then(d=>{
-      if (d.error) { addPMsg('ai', d.error); return; }
-      addPMsg('ai', d.reply);
-      if (d.wrapped) showPromptFinish();
-    });
-}
+// 审题收尾：让他自己写审题笔记（不代写）。原先这段挂在表单里的 p_chat 上，
+// 现已并入主对话区，与写作轮共用同一块消息流。
 function showPromptFinish() {
   if (document.getElementById('p_finish')) return;
-  const box = document.getElementById('p_chat');
+  const box = document.getElementById('chatbox');
   const div = document.createElement('div');
   div.id = 'p_finish';
-  div.style.cssText = 'margin-top:16px;padding:14px;border:1px solid #d9c9a3;border-radius:8px;background:#fffdf7;';
-  div.innerHTML = '<div style="font-size:14px;font-weight:500;margin-bottom:8px">把你的审题笔记写下来（这一步必须你自己写）</div>'
-    + '<textarea id="p_note" style="width:100%;min-height:110px;padding:9px;border:1px solid #d9c9a3;border-radius:8px;box-sizing:border-box;" '
+  div.style.cssText = 'margin:14px 0 4px;padding:14px;border:1px solid #d9c9a3;border-radius:10px;background:#fffdf7;';
+  div.innerHTML = '<div style="font-size:14px;font-weight:600;margin-bottom:8px">把你的审题笔记写下来（这一步必须你自己写）</div>'
+    + '<textarea id="p_note" style="width:100%;min-height:110px;padding:9px;border:1px solid #d9c9a3;border-radius:8px;box-sizing:border-box;font-family:inherit;font-size:15px;" '
     + 'placeholder="三行就够：&#10;· 这个题目的核心概念是……，它不是……&#10;· 我打算在文章里说的是……&#10;· 这个区分我要用在文章的……地方"></textarea>'
     + '<div style="margin-top:8px"><button class="btn btn-primary" onclick="finishPrompt()">写完了，进入写作</button></div>';
   box.appendChild(div);
-  document.getElementById('p_note').focus();
+  box.scrollTop = box.scrollHeight;
+  const row = document.getElementById('inputRow');
+  if (row) row.classList.add('hidden');   // 笔记没写完，别再接着聊
+  const el = document.getElementById('progress');
+  if (el) el.textContent = '审题已聊完';
+  const note = document.getElementById('p_note');
+  if (note) note.focus();
 }
 function finishPrompt() {
   const note = document.getElementById('p_note').value.trim();
@@ -582,8 +562,9 @@ function doSend(text) {
     .then(d => {
       clearTimeout(timer); removeLoading(loading); sending = false;
       if (d.error) { resendText = text; addError(); return; }
-      addMsg('ai', d.reply, d.strategy);
-      if (d.wrapped) showWrapped();
+      // 审题轮不打「策略：xx」标签——那是写作轮的六策略，审题用的是概念辨析
+      addMsg('ai', d.reply, STAGE0 ? '' : d.strategy);
+      if (d.wrapped) { STAGE0 ? showPromptFinish() : showWrapped(); }
     })
     .catch(() => {
       clearTimeout(timer); removeLoading(loading); sending = false;
@@ -614,9 +595,10 @@ function loadHistoryList(){
     if (!list.length) { box.innerHTML = '<div style="color:#9aa5b1;padding:12px">还没有往期对话</div>'; return; }
     list.forEach(item=>{
       const div = document.createElement('div');
+      const rname = (item.round === 0) ? '审题' : ('第'+item.round+'轮');
       div.style.cssText = 'padding:10px 12px;border:1px solid #eef0f2;border-radius:10px;margin-bottom:8px;cursor:pointer;background:#fafbfc';
-      div.innerHTML = '<div style="font-size:13px;color:#52606d">第'+item.round+'轮'
-                    + (item.draft_type ? '（'+escapeHtml(item.draft_type)+'）' : '')
+      div.innerHTML = '<div style="font-size:13px;color:#52606d">'+rname
+                    + (item.draft_type && item.round !== 0 ? '（'+escapeHtml(item.draft_type)+'）' : '')
                     + ' · 阶段'+item.stage+' · '+item.created_at+'</div>'
                     + '<div style="font-size:12px;color:#9aa5b1;margin-top:4px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">'+((item.preview||'').replace(/</g,'&lt;'))+'</div>';
       div.onclick = ()=>openHistory(item.conv_id);

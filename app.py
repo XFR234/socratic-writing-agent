@@ -1519,16 +1519,58 @@ def ensure_round_conversation(student_id, essay="", topic="", material=""):
 
 
 # ---------------- 路由：学生端 ----------------
+def _resume_stage0_conversation(student_id, force=False):
+    """阶段 0（审题）进行中的对话 id；不存在则返回 None。
+
+    审题必须能"刷新载回"：学生填完题目材料点「先做审题」，页面切到审题界面；
+    只要他一刷新（手机端切后台回来就会刷新），若没有这条逻辑就掉回首页，
+    刚才那一屏对话看不见了，他还以为白聊了。
+
+    force=True：学生**主动**又点了一次「先做审题」，即使上次已写过审题笔记，
+    也让他回到那条记录接着说（他想再琢磨一遍题目，这是允许的）。
+    自动恢复（刷新）时不 force——写完笔记就该回正常首页，别把他一直按在审题界面。
+    """
+    conn = get_db()
+    try:
+        row = conn.execute(
+            "SELECT id FROM conversations WHERE student_id=? AND round=0 "
+            "ORDER BY id DESC LIMIT 1", (student_id,)).fetchone()
+        if not row:
+            return None
+        if force:
+            return row["id"]
+        # 已经写过审题笔记＝审题结束，不该再把他拉回审题界面
+        done = conn.execute(
+            "SELECT 1 FROM messages WHERE conversation_id=? AND role='user' "
+            "AND content LIKE ? LIMIT 1",
+            (row["id"], "%【我的审题笔记】%")).fetchone()
+        return None if done else row["id"]
+    finally:
+        conn.close()
+
+
 @app.route("/")
 def index():
     logged_in = "student_id" in session
     history_messages = []
     wrapped = False
+    stage0 = False        # 是否正处于「阶段 0 · 审题对话」
+    conv_id = None
     if logged_in and session.get("student_id"):
-        # 打开/刷新页面即按教师当前设定的轮次加载或新建对应对话，
-        # 不必重新提交登录表单，避免“切了轮次却只显示一个”的困惑。
         student_id = session["student_id"]
-        conv_id, _ = ensure_round_conversation(student_id)
+        # 审题未结束 → 优先回到审题界面：这一屏只干一件事，别和写作表单混在一起
+        if session.get("stage0"):
+            conv_id = _resume_stage0_conversation(
+                student_id, force=bool(session.get("stage0_force")))
+            if conv_id:
+                stage0 = True
+            else:
+                session.pop("stage0", None)
+                session.pop("stage0_force", None)
+        if not stage0:
+            # 打开/刷新页面即按教师当前设定的轮次加载或新建对应对话，
+            # 不必重新提交登录表单，避免“切了轮次却只显示一个”的困惑。
+            conv_id, _ = ensure_round_conversation(student_id)
         if conv_id:
             session["conv_id"] = conv_id
             conn = get_db()
@@ -1539,7 +1581,8 @@ def index():
             conn.close()
             history_messages = [{"role": r["role"], "content": r["content"],
                                  "strategy": r["strategy"]} for r in rows]
-            # 收尾与否完全由 AI 判断：它以【策略：回顾看】收尾即视为本组结束
+            # 收尾与否完全由 AI 判断：它以【策略：回顾看】收尾即视为本组结束。
+            # 审题轮同一条判据——收尾后该让学生写他自己的审题笔记。
             wrapped = any(m["strategy"] == "回顾看" for m in history_messages
                           if m["role"] == "assistant")
         # 若 conv_id 为 None（本轮尚未提交作文），保留登录框让用户粘贴，history_messages 为空
@@ -1548,6 +1591,7 @@ def index():
         student_name=session.get("student_name", ""),
         round_num=get_active_round(),
         stage=get_active_stage(),
+        stage0=stage0,
         strategies=STRATEGY_INFO,
         strategy_order=STRATEGY_ORDER,
         stage2_order=__import__("prompts").STAGE2_CARD_ORDER,
@@ -1685,6 +1729,8 @@ def start_prompt():
     session["student_name"] = name
     session["conv_id"] = conv_id
     session["stage0"] = True
+    # 主动进来的：即使上次已写过审题笔记，也让他回到那条记录接着说
+    session["stage0_force"] = True
     conn2 = get_db()
     rows = conn2.execute(
         "SELECT role, content, strategy FROM messages WHERE conversation_id=? ORDER BY id",
@@ -1712,6 +1758,7 @@ def finish_prompt():
     conn.commit()
     conn.close()
     session.pop("stage0", None)
+    session.pop("stage0_force", None)
     return jsonify({"ok": True, "next": "/"})
 
 

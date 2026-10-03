@@ -132,6 +132,13 @@
       <input id="name" placeholder="请输入你的姓名">
       <label>学号（选填）</label>
       <input id="sid" placeholder="选填">
+      <div id="topicBox">
+        <label>作文题目（<b>建议填</b>）</label>
+        <input id="topic" placeholder="例如：学以成人">
+        <label>材料／写作要求（<b>选填</b>，有就贴上）</label>
+        <textarea id="material" style="min-height:70px" placeholder="把题目下面的材料、写作要求或者提示语贴上来。填了之后，苏格拉底知道你审的是哪道题，能看出你有没有跑题。"></textarea>
+        <div class="hint">这两项不填也能开始，但填了以后追问会更扣题——你写的东西离题太远时，它能指出来。</div>
+      </div>
       <div id="essayBox">
         {% if draft_type == '升格稿' %}
         <label>粘贴你<b>修改后的升格稿</b>（<b>必填</b>）</label>
@@ -144,6 +151,22 @@
       </div>
       <div style="margin-top:16px">
         <button class="btn btn-primary" onclick="startChat()">开始对话</button>
+      </div>
+      <div style="margin-top:10px">
+        <button class="btn" style="background:#fff;color:#8a6a2a;border:1px solid #d9c9a3" onclick="showPromptBox()">先做审题 · 概念辨析（不用写作文）</button>
+      </div>
+      <div id="promptBox" class="form hidden" style="margin-top:14px;padding:14px;border:1px dashed #d9c9a3;border-radius:8px">
+        <div class="hint" style="margin-bottom:10px">审题阶段只做一件事：把题目的核心概念说准。不用写作文，也不会有标准答案给你。</div>
+        <label>作文题目 *</label>
+        <input id="p_topic" placeholder="例如：学以成人">
+        <label>材料／写作要求（选填）</label>
+        <textarea id="p_material" style="min-height:70px" placeholder="把材料贴上来（没有也可以，只给题目也行）"></textarea>
+        <label>你自己的初步想法（选填）</label>
+        <textarea id="p_idea" style="min-height:60px" placeholder="你觉得这道题在问什么？先随便写，苏格拉底会抓着你的理解追问。"></textarea>
+        <div style="margin-top:12px">
+          <button class="btn btn-primary" onclick="startPrompt()">开始审题</button>
+        </div>
+        <div id="p_chat" class="hidden" style="margin-top:14px"></div>
       </div>
       <div class="hint">对话内容会由教师从后台查看并用于研究分析。请文明交流，避开敏感话题。</div>
 
@@ -199,10 +222,10 @@
               你可以顺着他的问题答，也可以主动说“我还没想清楚”。
             </div>
             <div class="chip-row">
-              <button class="chip" onclick="setInput('我还没想清楚，你能再问具体一点吗？')">我还没想清楚</button>
-              <button class="chip" onclick="setInput('能给我一个生活中的例子吗？')">想要个例子</button>
+              <button class="chip" onclick="setInput('我还没想清楚，你能再问具体一点吗？')">我卡住了，换个方式问我</button>
               <button class="chip" onclick="setInput('我觉得我的论点是……')">我想重新说论点</button>
             </div>
+            <div class="hint" style="margin-top:8px">卡住的时候直接说就行——它不会给你答案，但会换个小一点的问题，并且把你自己写过的句子指给你看。</div>
           </div>
         {% endif %}
 
@@ -283,13 +306,15 @@ function startChat() {
   if (!name) { alert('请填写姓名'); return; }
   const sid = document.getElementById('sid').value.trim();
   const essay = document.getElementById('essay').value.trim();
+  const topic = document.getElementById('topic') ? document.getElementById('topic').value.trim() : '';
+  const material = document.getElementById('material') ? document.getElementById('material').value.trim() : '';
   if (essay.length < MIN_ESSAY_LEN) {
     alert('请粘贴完整的作文（不少于 ' + MIN_ESSAY_LEN + ' 字）。\n'
         + '只写一句观点不够——AI 要读完整篇，才能找到你论证里的问题。');
     return;
   }
   fetch('/start', {method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'},
-    body:`name=${encodeURIComponent(name)}&sid=${encodeURIComponent(sid)}&essay=${encodeURIComponent(essay)}`})
+    body:`name=${encodeURIComponent(name)}&sid=${encodeURIComponent(sid)}&essay=${encodeURIComponent(essay)}&topic=${encodeURIComponent(topic)}&material=${encodeURIComponent(material)}`})
     .then(r=>r.json()).then(d=>{
       if (d.error) { alert(d.error); return; }
       document.getElementById('startBox').classList.add('hidden');
@@ -303,6 +328,93 @@ function setInput(text) {
   const input = document.getElementById('msg');
   input.value = text;
   input.focus();
+}
+
+// ============ 阶段 0：审题对话（概念辨析） ============
+function showPromptBox() {
+  document.getElementById('promptBox').classList.remove('hidden');
+}
+function addPMsg(who, text) {
+  const box = document.getElementById('p_chat');
+  const div = document.createElement('div');
+  div.style.margin = '8px 0';
+  div.style.padding = '9px 12px';
+  div.style.borderRadius = '10px';
+  div.style.fontSize = '14px';
+  div.style.lineHeight = '1.6';
+  if (who === 'me') {
+    div.style.background = '#e8f0fe'; div.style.color = '#2c3e50'; div.style.marginLeft = '18%';
+  } else {
+    div.style.background = '#faf6ec'; div.style.color = '#3d3a33'; div.style.marginRight = '18%';
+  }
+  div.textContent = text;
+  box.appendChild(div);
+  box.scrollTop = box.scrollHeight;
+}
+function startPrompt() {
+  const name = document.getElementById('name').value.trim();
+  if (!name) { alert('请先填写姓名'); return; }
+  const topic = document.getElementById('p_topic').value.trim();
+  if (!topic) { alert('请填写作文题目'); return; }
+  const material = document.getElementById('p_material').value.trim();
+  const idea = document.getElementById('p_idea').value.trim();
+  const box = document.getElementById('p_chat');
+  box.classList.remove('hidden');
+  box.innerHTML = '<div style="color:#9aa5b1;font-size:13px">苏格拉底正在思考…</div>';
+  fetch('/start_prompt', {method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'},
+    body:`name=${encodeURIComponent(name)}&topic=${encodeURIComponent(topic)}&material=${encodeURIComponent(material)}&idea=${encodeURIComponent(idea)}`})
+    .then(r=>r.json()).then(d=>{
+      if (d.error) { box.innerHTML = ''; alert(d.error); return; }
+      box.innerHTML = '';
+      (d.history||[]).forEach(m => addPMsg(m.role==='assistant'?'ai':'me', m.content));
+      const inp = document.createElement('input');
+      inp.id = 'p_msg';
+      inp.placeholder = '说说你怎么理解这个概念（不确定也没关系）';
+      inp.style.cssText = 'width:100%;padding:9px 12px;border:1px solid #d9c9a3;border-radius:8px;margin-top:10px;box-sizing:border-box;';
+      const btn = document.createElement('button');
+      btn.className = 'btn btn-primary'; btn.textContent = '发送';
+      btn.style.marginTop = '8px';
+      btn.onclick = promptSend;
+      const wrap = document.createElement('div');
+      wrap.appendChild(inp); wrap.appendChild(btn);
+      box.appendChild(wrap);
+      inp.focus();
+      inp.addEventListener('keydown', e => { if (e.key === 'Enter') promptSend(); });
+    });
+}
+function promptSend() {
+  const inp = document.getElementById('p_msg');
+  const text = inp.value.trim();
+  if (!text) return;
+  addPMsg('me', text);
+  inp.value = '';
+  fetch('/chat', {method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'},
+    body:`message=${encodeURIComponent(text)}`})
+    .then(r=>r.json()).then(d=>{
+      if (d.error) { addPMsg('ai', d.error); return; }
+      addPMsg('ai', d.reply);
+      if (d.wrapped) showPromptFinish();
+    });
+}
+function showPromptFinish() {
+  if (document.getElementById('p_finish')) return;
+  const box = document.getElementById('p_chat');
+  const div = document.createElement('div');
+  div.id = 'p_finish';
+  div.style.cssText = 'margin-top:16px;padding:14px;border:1px solid #d9c9a3;border-radius:8px;background:#fffdf7;';
+  div.innerHTML = '<div style="font-size:14px;font-weight:500;margin-bottom:8px">把你的审题笔记写下来（这一步必须你自己写）</div>'
+    + '<textarea id="p_note" style="width:100%;min-height:110px;padding:9px;border:1px solid #d9c9a3;border-radius:8px;box-sizing:border-box;" '
+    + 'placeholder="三行就够：&#10;· 这个题目的核心概念是……，它不是……&#10;· 我打算在文章里说的是……&#10;· 这个区分我要用在文章的……地方"></textarea>'
+    + '<div style="margin-top:8px"><button class="btn btn-primary" onclick="finishPrompt()">写完了，进入写作</button></div>';
+  box.appendChild(div);
+  document.getElementById('p_note').focus();
+}
+function finishPrompt() {
+  const note = document.getElementById('p_note').value.trim();
+  if (note.length < 10) { alert('笔记太短了——这一步得你自己写，我不替你填'); return; }
+  fetch('/finish_prompt', {method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'},
+    body:`note=${encodeURIComponent(note)}`})
+    .then(r=>r.json()).then(d=>{ if (d.error) { alert(d.error); return; } location.href = d.next; });
 }
 
 function useStrategy(key) {

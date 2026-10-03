@@ -27,8 +27,10 @@ from prompts import (
     STRATEGY_INFO, STRATEGY_ORDER, STAGE2_SYSTEM, STAGE1_OPENING_NO_ESSAY,
     STAGE2_OPENING, build_stage1_opening, build_stage2_user_prefix,
     build_stage1_system, ROUND_STAGE, TOULMIN_MAP, DRAFT_TYPE_BY_ROUND,
-    POINT_ORDER, POINT_DESC,
+    POINT_ORDER, POINT_DESC, build_stage0_system, STAGE0_OPENING,
+    STAGE0_WRAP_BLOCK,
 )
+import textbook
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 # DB_PATH 可经环境变量覆盖（如需挂载持久磁盘）；默认项目内 SQLite 文件
@@ -107,6 +109,14 @@ def init_db():
     # 追问方向记录：这一轮 AI 追的是哪个断裂点。**只用于内部推进**（让判定知道
     # 哪些点已经追过、该换点了），不作为研究编码数据——断裂点编码由研究者人工完成。
     ensure_column(conn, "messages", "point", "TEXT")
+    # 作文题目与材料（老师需求①第一版）：AI 没有这两个字段就不知道自己在审什么题，
+    # 只能从作文里反推题意，容易把"跑题"当成论证断裂点去追，而不是指出跑题本身。
+    ensure_column(conn, "conversations", "topic", "TEXT")
+    ensure_column(conn, "conversations", "material", "TEXT")
+    # 求助回合标记：这一回合是不是在回应学生的求助（direct / repeat）。
+    # **只用于描述性统计与事后复核，不参与断裂点编码**（编码仍由研究者人工完成）。
+    ensure_column(conn, "messages", "help_type", "TEXT")
+    # 阶段 0（审题）独立成一轮：round=0，题目材料存在这一轮里
     conn.commit()
     conn.close()
 
@@ -244,18 +254,105 @@ FILLER_RE = re.compile(
     r"[，,]?\s*"
 )
 
+# 句子开头的"这一点的难点"式铺垫。实测 glm-4-flash 很爱用，一整组对话里
+# 连着七八轮都拿这句开头（"这个点确实挺抽象的""这个点确实挺难把握的"），
+# 读起来像复读机。它不是废话内容，但放在开头会把真正的追问压到后面，
+# 而且让每轮看起来都差不多。所以整句删掉，只留下后面那个实质问题。
+# 逐个短语贪心吃掉（可重复），吃干净为止。
+LEADIN_PHRASES = [
+    "这个点确实挺抽象的", "这个点确实挺难把握的", "这个点确实挺难理解的",
+    "这个点确实挺重要的", "这个点确实挺关键的", "这个点确实有点抽象",
+    "这一点确实挺抽象的", "这一点确实挺难", "这确实挺难",
+    "这个问题确实挺抽象", "这个问题确实挺难", "这个问题有点抽象",
+    "这个点确实", "这一点确实", "这个问题确实", "这确实",
+    "理解起来有难度", "理解起来有点难度", "理解起来不太容易",
+    "说起来有点抽象", "说清楚不太容易", "不太好说",
+    "这个点有点抽象", "这一点有点抽象", "有点抽象", "挺抽象的",
+    "有点难懂", "不太好懂", "不太容易理解", "不容易说清", "不太好说清",
+    "这个点挺难", "这一点挺难", "确实挺难", "挺难把握", "难以把握",
+    "挺重要", "很重要", "挺关键", "很关键", "挺抽象",
+    "但也很关键", "但也很重要",
+]
 
-def clean_ai_tics(text, is_opening=False):
-    """清掉追问里的套话。
+# 空洞的正面评价：说了等于没说，还会把后面的追问压成"补充说明"。
+# 竞品整程都是"你提到XX，很好/这是很关键的判断"，学生因此感受不到被追问
+# ——只夸不顶，追问就退化成采访。报告附录一是策略原文、不改，这类空话在这里单独清。
+EMPTY_PRAISE_RE = re.compile(
+    r"^(?:嗯+|哦+|啊+|哎呀|唉)[，,]?"
+    r"|(?:这话说得|你说的这话|你这句话)[^。！？]{0,12}(?:挺|很|真)?(?:有见地|不错|很好|到位|准确)[，,]?"
+    r"|^(?:不错|很好|很好啊|说得好|说得对|有道理)[，,]"
+    # 夹在中间的空洞评价（"这个想法很有意思""这确实挺棘手的"）
+    r"|(?:这个想法|这个说法|这个观点|这一点|这个问题|这句话)[^。！？]{0,4}"
+    r"(?:很有意思|挺有意思|很有意思|很好|挺重要|挺关键|挺棘手|挺难处理|值得肯定)[，,]?"
+)
 
-    两类分开处理，因为它们出现的规律不同：
-    · 引用式（“你提到”“你刚才说”）只出现在开头，只在开头清；
-    · 垫话式（“我想了解一下”“那么，我想知道”）会接在复述学生那句话之后，
-      位置飘忽，所以改成**在第一句问号之前整段里清**——这段里的垫话删掉都不影响语义。
-    """
+# 语病清理：模型偶尔会写出"不过过""所以所以"这类叠字。
+DUP_WORD_RE = re.compile(r"(不过|所以|但是|而且|然后|其实|就是|这个|一个|真的)\1+")
+
+
+def strip_leadin(text):
+    """删掉句首的"这一点的难点"式铺垫（贪心吃短语，重复吃）。"""
     if not text:
         return text
     out = text.lstrip()
+    orig = out
+    for _ in range(5):
+        before = out
+        for p in LEADIN_PHRASES:
+            if out.startswith(p):
+                out = out[len(p):]
+                break
+        out = out.lstrip("，,、。：:；; ")
+        if out == before:
+            break
+    # 吃到连接词（不过/但是/所以…）也继续吃掉，这些都是铺垫的一部分
+    for _ in range(3):
+        before = out
+        for c in ("不过", "但是", "所以", "因此", "而且", "其实", "但"):
+            if out.startswith(c):
+                out = out[len(c):].lstrip("，,、。：:；; ")
+                break
+        if out == before:
+            break
+    # 清掉残留的悬空助词（删完可能只剩"的""地"这种没主语的碎片）
+    for _ in range(2):
+        m = re.match(r"^(的|地|了|着)\s*[，,、]?\s*", out)
+        if not m:
+            break
+        cand = out[m.end():]
+        if len(cand) < 12:
+            return orig
+        out = cand
+    # 安全检查：删完必须还剩实质内容，且不能把整句吃光
+    if len(out) < 12:
+        return orig
+    return out
+
+
+def clean_ai_tics(text, is_opening=False, keep_leadin=False):
+    """清掉追问里的套话。
+
+    三类分开处理，因为它们出现的规律不同：
+    · 引用式（“你提到”“你刚才说”）只出现在开头，只在开头清；
+    · 垫话式（“我想了解一下”“那么，我想知道”）会接在复述学生那句话之后，
+      位置飘忽，所以改成**在第一句问号之前整段里清**——这段里的垫话删掉都不影响语义；
+    · 难点铺垫式（“这个点确实挺抽象的”）在正常追问里要清（一整组对话连用七八轮
+      就像复读机），但**求助回合要保留**——那里它是设计好的安抚句。
+    """
+    if not text:
+        return text
+    orig = text.lstrip()
+    out = DUP_WORD_RE.sub(r"\1", orig)
+    # 去掉句首的空洞表扬（"这话说得挺有见地""嗯，"）：它会把追问压成补充说明
+    for _ in range(3):
+        new = EMPTY_PRAISE_RE.sub("", out, count=1)
+        new = new.lstrip("，,、。：:；; ")
+        if new == out or len(new) < 12:
+            break
+        out = new
+    # 先去掉句首的难点铺垫（求助回合保留安抚句）
+    if not is_opening and not keep_leadin:
+        out = strip_leadin(out)
     if is_opening:
         for t in sorted(OPENING_SAY_OPENERS, key=len, reverse=True):
             if out.startswith(t):
@@ -282,7 +379,38 @@ def clean_ai_tics(text, is_opening=False):
         if new_seg == seg:
             break
         seg = new_seg
-    return seg + tail
+    return fix_dangling_question(seg + tail)
+
+
+def fix_dangling_question(text):
+    """修掉"比如？""对不对？"这类没内容的空问句尾巴。
+
+    实测求助回合出现过「你可以从这句话里挑出两三项来说说看，比如？或者……」
+    ——"比如？"单独成问句，读者不知道要回答什么。
+
+    安全阀：**删完整句如果一个问号都不剩，就不删**。句末那种"你怎么看，行不行？"
+    虽然啰嗦，但它是真正的问句，删了就变成陈述句、对话直接断掉。
+    """
+    if not text:
+        return text
+    orig = text
+    out = text
+    # 形如「……吧，比如？或者……」：空问句夹在正文中间，后面还有内容。
+    # 后面只要还有内容（"或者"也算）就说明真正的问句在后面那个。
+    out = re.sub(r"[，,]\s*(?:比如|譬如|对不对|是吗|对吧|是不是|好不好|行不行|可以吗)\s*[？?]\s*"
+                 r"(?=(?:或者|或是|还是|接下来|下一步|你|请)[^。！？]{0,40})",
+                 "。", out)
+    # 句末孤立的空问句
+    out = re.sub(r"[。；;，,]\s*(?:比如|对不对|对吧|行不行|可以吗)\s*[？?]\s*$", "。", out)
+    out = out.replace("。。", "。")
+    out = out.strip()
+    # 安全阀一：原文只有一个问号时，说明那很可能就是唯一的真问句，不能删
+    if out.count("？") == 0 and orig.count("？") <= 1:
+        return orig
+    # 安全阀二：删完剩下的太短
+    if len(out) < 10:
+        return orig
+    return out
 
 
 def collect_prev_questions(history, limit=5, width=110):
@@ -652,6 +780,317 @@ def judge_point(essay, dialogue, asked_points=None):
 DEMO_STRATEGY_CYCLE = STRATEGY_ORDER
 
 
+# ---- 防代写：生成后确定性检查（2026-10-03） ----
+# 动机：竞品实测第 4 轮，学生放弃后它直接说"你可以进一步说明……比如书本带来
+# 认知框架、实践带来价值体认"——把学生该想的内容自己说了，违背它自己的
+# "不代写"声明。提示词里禁过很多次，glm-4-flash 照写不误（跟"你提到"一个道理，
+# 是训练先验），所以只能在生成后做确定性检查。
+# 判据：出现"替他把话说出来"的话术特征就判违规，重新生成（限次数）。
+VIOLATION_PATTERNS = [
+    # 一、AI 主动提供材料的话术
+    r"你可以(这样|这样写|写|加|举|用|分)[^？]{0,24}例子",
+    r"比如(举)?个?例子[^？]{0,8}[：:]",                   # "比如：爱因斯坦……"
+    r"我可以(给你|为你|帮你)(写|提供|列)",
+    r"以下是(一个|几个)[^？]{0,10}(例子|素材|范文)",
+    # 带引号的直接引用（无论中文引号还是英文引号，都是"把话替他说出来"）
+    r"你可以用[“\"][^”\"]{2,20}[”\"]",
+    r"建议(你)?[^\n]{0,14}(用|写|举|加)[^\n]{0,10}[\"“][^\"”]{2,24}[\"”]",
+    r"(就像|正如|比如说)(爱因斯坦|居里夫人|司马迁|苏武|荀子|孔子|钱学森|屠呦呦)[^？]{0,40}[。！？]",
+    # 典型的"我来给你"话术
+    r"我(来)?给你(列|举|举出|提供|找)[^\n]{0,10}(例子|素材|材料|范文)",
+    r"我(来)?给(你)?(举|列)[^\n]{0,6}(个|几|两)[^\n]{0,6}例子",
+    r"比如[：:][^\n]{0,4}(爱因斯坦|居里夫人|司马迁|苏武|荀子|孔子|钱学森|屠呦呦|居里)",
+    r"(建议|推荐)(你)?(在|于)[^\n]{0,10}(用|举|写)[^\n]{0,10}(例子|素材|材料|人物)",
+    # 人物名 + 例子/素材出现在同一句里，就是 AI 在替他挑材料
+    r"(爱因斯坦|居里夫人|司马迁|苏武|荀子|孔子|钱学森|屠呦呦|欧阳修|苏轼)[^\n]{0,14}(的例子|这个例子|的事|的故事)[^\n]{0,30}[。！？]",
+    # 二、AI 自造材料（竞品第 4 轮的原话形态：把因果直接替他讲出来）
+    r"带来[^，。？]{0,6}认知框架",
+    r"(建议|可以)(先)?(把|用)[^。？]{0,16}(写|说|讲)成",
+    # 三、AI 直接把概念的定义说出来了（求助回合最常见的破功方式）。
+    # 实测：学生说"你直接告诉我吧"，它答"精湛学识可能指的是他们在生化领域的
+    # 专业知识和技能"——这就是替他把答案说了，学生不用再想。
+    r"(可能|应该|大概|其实|就是|指的是|意思是|所谓)[^。？]{2,24}(指的是|是指|意思是|就是|即为)[^。？]{2,40}",
+    r"(就是|便是|即)[^。？]{2,20}(的意思|的含义)",
+    r"所谓[“\"][^”\"]{2,16}[”\"][，,]?[^。？]{0,6}(是|指)",
+]
+# 例外：这些是**引用他自己写的内容**，属于合法抓手，不能误伤
+_SELF_QUOTE_OK = ("你在作文里写", "你自己写的", "你刚才说", "你提到", "你的作文",
+                  "你在文中", "你写的")
+
+
+# 求助回合专用的"给答案"形态（比常规追问严格）。
+# 必须定义在 check_no_ghostwriting **之前**（函数体里引用它）。
+HELP_ANSWER_PATTERNS = [
+    # 直接替学生定义概念："X 指的是……" "X 就是……"
+    # 注意 "可能是指""应该是说"这种贴得很近的形态（实测漏过一次）
+    r"(可能|应该|大概|其实|就是|指的是|意思是|所谓)[^。？]{0,6}(指的是|是指|意思是|即为|是)",
+    r"你(说的|写的|提到的)[^。？]{0,12}[“\"][^”\"]{2,14}[”\"][^。？]{0,6}(就是|指的是|意思是)",
+    # "你可以从……入手" 这种把路径也替他铺好的
+    r"你可以从[^。？]{2,30}(入手|开始|出发)",
+    r"(试着|尝试)(着)?具体(化|说清|描述)",
+]
+
+
+def check_no_ghostwriting(text, help_mode=False):
+    """检查 AI 有没有替学生把论证说出来。返回违规话术的片段，没违规返回 ""。
+
+    误伤的代价（把合法的抓手判成代写）比漏检小，所以只在**特征很明显**时判违规：
+    要求命中的是"AI 主动提供材料"的话术，引用学生自己写的不算。
+
+    help_mode=True 时（求助回合）标准更严：学生正在说"我不知道、直接告诉我"，
+    这时候任何"替他定义概念"的话都是重灾区——**学生的诉求没被满足，他会觉得
+    被敷衍**。实测这里最容易破功，所以额外查一组"给答案"的形态。
+    """
+    if not text:
+        return ""
+    body = text
+    for pat in VIOLATION_PATTERNS:
+        m = re.search(pat, body)
+        if not m:
+            continue
+        # 命中的片段如果同时是在引用学生自己的话，放行
+        ctx = body[max(0, m.start() - 40):m.end() + 10]
+        if any(k in ctx for k in _SELF_QUOTE_OK):
+            continue
+        return m.group(0)
+    if help_mode:
+        for pat in HELP_ANSWER_PATTERNS:
+            m = re.search(pat, body)
+            if not m:
+                continue
+            ctx = body[max(0, m.start() - 40):m.end() + 10]
+            if any(k in ctx for k in _SELF_QUOTE_OK):
+                continue
+            return m.group(0)
+    return ""
+
+
+# 求助回合专用的"给答案"形态（比常规追问严格）
+HELP_ANSWER_PATTERNS = [
+    # 直接替学生定义概念："X 指的是……" "X 就是……"
+    # 注意 "可能是指""应该是说"这种贴得很近的形态（实测漏过一次）
+    r"(可能|应该|大概|其实|就是|指的是|意思是|所谓)[^。？]{0,6}(指的是|是指|意思是|即为|是)",
+    r"你(说的|写的|提到的)[^。？]{0,12}[“\"][^”\"]{2,14}[”\"][^。？]{0,6}(就是|指的是|意思是)",
+    # "你可以从……入手" 这种把路径也替他铺好的
+    r"你可以从[^。？]{2,30}(入手|开始|出发)",
+    r"(试着|尝试)(着)?具体(化|说清|描述)",
+]
+
+
+# 阶段 0 收尾判据：学生是否把"不是什么"和边界说出来了。
+# 为什么要确定性判断而不是判定调用：这是流程性判断（他有没有做这两件事），
+# 用关键词更稳、也省一次 API；判错的代价只是收早或收晚，不影响数据性质。
+_STAGE0_MARKERS = ("不是", "不算", "不包括", "区别", "边界", "算不算", "而是指",
+                   "反例", "比如")
+
+
+def _stage0_concepts_clear(user_text):
+    t = (user_text or "")
+    if len(t) < 30:
+        return False          # 太短，多半只是敷衍
+    return sum(1 for k in _STAGE0_MARKERS if k in t) >= 2
+
+
+# ---- 求助回合：识别与回应（2026-10-03） ----
+# 问题来源：真实 API 实测，学生连说三次求助（"你直接告诉我""你还没回答我"
+# "能给我个例子吗"），系统三次都当没听见——因为 stage==1 分支完全按断裂点推进，
+# 学生那句话被当作"对上一问的回答"，不作为"诉求"被识别。
+# 理论依据：Wood/Bruner/Ross (1976) 脚手架六功能之「受挫控制」；
+#           van de Pol 等 (2010)「应变性」——支架强度须随学生受阻状态浮动。
+
+# 确定性前置规则：只处理"抱怨没被回答"这一类，特征极明显，不需要模型。
+# 为什么加这层：实测 judge_help_request 对「你还没回答我。我真的不知道 X」
+# 这类"抱怨+不会"的混合句**稳定误判成 direct**（连测 3 次全是 direct）——
+# 句子里的"我真的不知道"把它带偏了。而这类句式恰恰是最典型的 repeat，
+# 判错的代价是它按"回补上一轮"的方式去处理一个"要答案"的诉求。
+# 规则优先、模型兜底：特征明显的用规则，剩下的才交给模型。
+REPEAT_COMPLAINTS = (
+    "你没回答", "你还没回答", "你还没有回答", "你根本没回答", "你没理",
+    "你还没理", "你根本没说", "你还没说", "你没讲", "你还没讲",
+    "我刚不是说了", "我刚才不是说了", "我刚说了", "我说了你",
+    "你没听到", "你没看", "你绕开", "你躲", "你一直在绕", "别绕",
+    "你没有正面", "你没正面", "答非所问", "你根本没讲",
+)
+
+
+def _is_repeat_complaint(text):
+    """确定性地判「重复未答」。只认抱怨词，不做语义推断。"""
+    t = (text or "")
+    return any(k in t for k in REPEAT_COMPLAINTS)
+
+
+# 直接求助的确定性词表。分两类：
+#   要东西 = 明确在向 AI 要答案／材料
+#   承认不会 = 明确说自己没招了（但要成句，单独的"不知道"是敷衍作答）
+_DIRECT_ASKS = ("你直接告诉我", "直接告诉我", "告诉我吧", "你告诉我", "帮我写",
+                "给我写", "帮我看一下", "给个开头", "给个例子", "举个例子",
+                "给我个例", "给点素材", "给点材料", "提供素材", "能不能给",
+                "你能不能直接", "帮我看看怎么", "我不知道该怎么写", "不知道怎么写")
+_DIRECT_GIVEUP = ("我不太会", "我真的不会", "我完全不会", "我卡住了", "我卡在",
+                  "没思路", "我想不出来", "我写不出来", "我不敢写", "无从下手",
+                  "太难了", "好难", "我放弃", "我懵了", "我没头绪", "没想法")
+
+
+def _is_direct_help(text):
+    """确定性地判「直接求助」。要求"要东西"或成句的"承认不会"，
+    避免把敷衍作答（单独的"不知道"、两字回答）误判成求助。"""
+    t = (text or "")
+    if any(k in t for k in _DIRECT_ASKS):
+        return True
+    if len(t) >= 8 and any(k in t for k in _DIRECT_GIVEUP):
+        return True
+    return False
+
+
+JUDGE_HELP_SYSTEM = (
+    "你是教学对话分析助手，负责判断学生在苏格拉底式追问对话里这一句是不是在求助。"
+    "只输出一个 JSON 对象（json），不要输出任何解释文字，也不要用代码块包裹。"
+)
+
+JUDGE_HELP_TEMPLATE = """这是一段高中议论文写作的追问对话。AI 扮演"只问不答"的追问者。
+
+【最近几轮对话】
+{dialogue}
+
+【学生这一句】
+{last_user}
+
+请判断学生这一句属于哪一类：
+
+1. "repeat"：**他在抱怨你没理他上一次的问题**。特征是他提到了"上一次""刚才""还没"这类时间指向，
+   或者明确说"你没回答""你没理我""我问的是刚才那个"。
+   例子：「你还没回答我」「你还没说」「我刚不是说了吗」「你根本没讲」「你绕开我的问题了」
+   「你问的那个我没答」
+
+2. "direct"：**他在向你要东西**——要答案、要例子、要材料，或者说自己不会、卡住了、太难了。
+   例子：「你直接告诉我」「给我一个开头」「举个例子」「我不太会」「我不知道」「这个好难」
+   注意：如果他这句话里**同时**有"你没回答我"这种抱怨，算 repeat（他在抱怨，
+   他要的不是新答案，是把上一个问题说清楚）。
+
+3. "none"：**不是求助**。他是在回答你上一个问题（哪怕答得短、含糊、不对题）。
+   特别注意：只是回答很短（"是手段""不知道"）算 none，不算 direct——那是敷衍作答；
+   第一次问某个概念是什么意思，也不算求助，那是在回应你的追问。
+
+判断要保守：拿不准就判 none。只有他**明确在要东西**或**明确在抱怨你没理他**，才算 direct / repeat。
+
+输出格式：{{"help": "none"}}"""
+
+
+def judge_help_request(last_user, dialogue_tail=""):
+    """判断学生这一句是不是求助。返回 "none" / "direct" / "repeat"。
+
+    必须放在 judge_point **之前**：实测中只要判定了断裂点、就近约束就会把
+    追问方向绑死，学生说什么都影响不了它——那就还是"装聋"。
+
+    两层：确定性规则先看「重复未答」（特征明显、模型实测会误判），
+    其余交给模型；模型也判 direct 时，再用直接求助的词表兜一层。
+    """
+    if not last_user:
+        return "none"
+    if _is_repeat_complaint(last_user):
+        return "repeat"
+    # 直接求助的确定性词表：这些也是明确特征，不必浪费一次判定调用。
+    # 但要排除"只是回答很短"的情况（"不知道"单独出现时是敷衍作答，不是求助），
+    # 所以要求句子里还有"要东西"或"承认不会"的表达。
+    if _is_direct_help(last_user):
+        return "direct"
+    if not ZHIPU_API_KEY:
+        return "none"
+    prompt = JUDGE_HELP_TEMPLATE.format(
+        last_user=last_user[:400],
+        dialogue=(dialogue_tail or "")[-800:])
+    try:
+        raw = call_zhipu(JUDGE_HELP_SYSTEM, [("user", prompt)],
+                         json_mode=True, temperature=0)
+    except Exception:
+        return "none"
+    obj = parse_json_obj(raw)
+    if not obj:
+        return "none"
+    h = str(obj.get("help") or "none").strip().lower()
+    return h if h in ("direct", "repeat") else "none"
+
+
+def build_help_nudge(help_type, focus_point="", prev_question="", last_user="",
+                     textbook_hints=None, prev_questions=None):
+    """求助回合的就近约束。direct 与 repeat 的回应结构不同，要分开写。
+
+    两种都守同一条红线：**给抓手，不给答案**；抓手只能来自"他自己写过的"
+    或"教材篇目级线索"，AI 不得现造材料。
+    """
+    quote = (last_user or "").strip()
+    if len(quote) > 120:
+        quote = quote[:120] + "……"
+    head = ("（以上是你们的对话。学生刚才说的是：“" + quote + "”\n"
+            "**他不是在回答你的问题，他是在向你求助。**（本轮只针对这一件件事）\n")
+    # 把前几轮说过的抓手原样摊开：实测它会在连续几轮里复读同一段
+    #（"你可以从这句话里挑出两三项…或者先挑最明显的一项"连着两轮几乎一字不差），
+    # 光禁"不许重复"压不住，得把原句摆给它看。
+    asked = ""
+    if prev_questions:
+        asked = ("\n【你已经用过下面这些抓手——这一轮**必须换一个**，"
+                 "换个句子、换个角度、换更小的一步都可以，但别把它们再说一遍】\n"
+                 + "\n".join("· " + q for q in prev_questions) + "\n")
+    common = (
+        "\n【红线——违反这一条就等于替他写】\n"
+        "1. **绝对不能给出他想要的那个答案**：不要定义概念、不要写开头或段落、"
+        "不要举例证、不要报出课文内容。\n"
+        "2. **必须给他一个具体抓手**——他下一次能立刻接住、能说出话的那种。\n"
+        "3. 抓手只能来自两处：①他自己作文里已经写下的句子或他自己刚说过的话；"
+        "②教材的篇名（只提篇目，让他自己去回忆内容）。\n"
+        "4. **不许只有安慰没有抓手**。安慰一句就够，剩下的话必须把他推回他的作文。\n"
+        "5. 不要用“你提到”“我想了解一下”这类套话开场。\n"
+    )
+    if help_type == "repeat":
+        target = ("（他抱怨的是**你上一个问题没答到他**——注意：不是要你给答案，"
+                  "而是你上一轮问得太抽象、没落到他能接住的地方。）"
+                  if prev_question else
+                  "（他要的是你把上一个问题说清楚、说具体，不是要答案。）")
+        asked_note = ""
+        if prev_question:
+            asked_note = ("\n【你上一轮实际问的是】“" + prev_question[:160] + "”\n"
+                          "**这一回合必须和它不一样**：不许再把那个问法重说一遍、不许重复你上一轮"
+                          "给过的抓手、不许再说“这个我确实没答到”之后就重复原来的内容。\n")
+        return head + target + asked_note + (
+            "\n按这个顺序说三件事：\n"
+            "1. **先认一句错**（一句就够，不要反复道歉）："
+            "「这个我确实没答到」／「是我问得太绕了」——你确实问得不够清楚，这是事实；\n"
+            "2. **把上一个问题重新说一遍，这次要小得多、具体得多**，"
+            "让他一看就知道该答什么（比如把一个抽象的大问题，换成从他作文里挑两三个词这种小任务）；\n"
+            "3. **最后必须以一个问句收尾**，而且只问一个他能一口答上来的小问题。\n"
+            "**这一回合绝对不许出现「X 指的是……」这种把答案说出来的话。**\n"
+            "这一回合**不要**抛新的追问方向、不要再追别的断裂点，"
+            "也**绝对不要**在这一回合收尾（他还没补上，不许收摊）。\n"
+        ) + common
+    # direct
+    focus = ""
+    if focus_point and focus_point in POINT_DESC:
+        focus = ("**这一轮仍是在追同一个点——" + focus_point + "**，但难度要降下来：\n"
+                 + POINT_DESC[focus_point] + "\n"
+                 "他现在答不上来，所以别再抛那个大问题。\n")
+    tb = ""
+    if textbook_hints:
+        tb = ("\n" + textbook.format_textbook_hints(textbook_hints) + "\n")
+    return head + focus + (
+        "\n按这个顺序说三件事：\n"
+        "1. **一句安抚**（只一句）：承认这个点确实难、卡在这儿很正常。"
+        "不许说“你很有潜力”“你已经很好了”这种空话；\n"
+        "2. **给一个具体抓手**：把他自己作文里已经写下的、跟这个点相关的那句话指出来"
+        "（或按上面的教材线索提一个篇目），让他看出答案其实就在他自己写的东西里。"
+        "**只指路，不解释**——你一说清楚，答案就变成你给的了；\n"
+        "3. **然后把问题缩到他答得上**：不要再问“这个概念是什么意思”这种大问题，"
+        "要问一个具体的、能一口答上来的小问题——"
+        "比如让他从自己写过的那句话里挑出两三项、或者先说其中最明显的一项。"
+        "**最后必须以一个问句收尾。**\n"
+        "**这一回合绝对不许出现「X 指的是……」这种把答案说出来的话。**\n"
+        "这一回合**不要**收尾（他还没补上，不许收摊），"
+        "也**不要**换成另一个断裂点。\n"
+    ) + tb + common
+
+
+DEMO_STRATEGY_CYCLE = STRATEGY_ORDER
+
+
 def demo_respond(stage, history, last_user, round_num=1, is_opening=False, wrap_mode=""):
     """无 API key 时的演示应答，保证界面可跑通流程。
 
@@ -689,14 +1128,22 @@ def demo_respond(stage, history, last_user, round_num=1, is_opening=False, wrap_
 
 
 def generate_assistant(stage, history, last_user="", essay="", round_num=1, prev_essay="",
-                       wrap_mode="", is_opening=False, next_point="", point_repeat=0):
+                       wrap_mode="", is_opening=False, next_point="", point_repeat=0,
+                       help_type="", topic="", material="", prev_question="",
+                       stage0_wrap=False):
     """返回 (给学生的正文, 引导策略, 是否该收尾)。
     prev_essay：第2轮时传入该生第1轮的原稿，用于"对照升格稿再诊断"。
     wrap_mode："" 正常追问 / "now" 这一回合收尾 / "after" 收尾后学生又多说的。
-    is_opening：是否为本轮第一次追问（开场），此时不能说"针对他刚才那句"。"""
+    is_opening：是否为本轮第一次追问（开场），此时不能说"针对他刚才那句"。
+    help_type："direct" / "repeat" / ""（非求助）。非空时改走求助回合的回应结构。
+    topic/material：作文题目与材料（老师需求①第一版）。
+    stage0_wrap：阶段 0 审题对话的收尾。"""
     api_history = list(history)
-    if stage == 1:
-        system_prompt = build_stage1_system(round_num, prev_essay)
+    if stage == 0:
+        # 阶段 0（审题）：没有作文，只有题目与材料
+        system_prompt = build_stage0_system(topic, material)
+    elif stage == 1:
+        system_prompt = build_stage1_system(round_num, prev_essay, topic, material)
         if essay and essay.strip():
             if round_num == 2 and prev_essay and prev_essay.strip():
                 intro = (
@@ -717,11 +1164,28 @@ def generate_assistant(stage, history, last_user="", essay="", round_num=1, prev
         system_prompt = STAGE2_SYSTEM
     # 本回合是这一组里的第几次追问（开场算第 0 次）——告诉模型轮数，它才收得住尾
     turn_no = len([1 for r, _ in history if r == "assistant"]) + 1
-    # 关键：把当回合的即时指令放在对话最末尾（就近约束），
-    # 并把前面已问过的问题逐条摊给它看（防止换句式重问同一个点）
-    api_history = api_history + [("user", build_turn_nudge(
-        stage, is_opening, last_user, wrap_mode, turn_no,
-        collect_prev_questions(history), next_point, point_repeat))]
+    # 当回合的即时指令放在对话最末尾（就近约束）。
+    # 求助回合走另一套结构（build_help_nudge），它要求"不追新点、只解决求助"，
+    # 与常规追问的约束直接冲突，不能混用。
+    if help_type:
+        hints = None
+        if help_type == "direct":
+            # 教材线索：只在 direct（明确要材料）时给，repeat 问的是"你没答我"，跟教材无关
+            q = (last_user or "") + " " + " ".join(
+                (essay or "").split()[:120])
+            try:
+                hints = textbook.search_textbook(q, top_n=2)
+            except Exception:
+                hints = None
+        api_history = api_history + [("user", build_help_nudge(
+            help_type, next_point, prev_question, last_user, hints,
+            collect_prev_questions(history)))]
+    elif stage0_wrap:
+        api_history = api_history + [("user", STAGE0_WRAP_BLOCK)]
+    else:
+        api_history = api_history + [("user", build_turn_nudge(
+            stage, is_opening, last_user, wrap_mode, turn_no,
+            collect_prev_questions(history), next_point, point_repeat))]
     # 1) 正文：纯文本生成（不要求模型附带标注——实测它会漏、且会污染正文风格）
     text = ""
     if ZHIPU_API_KEY:
@@ -735,10 +1199,35 @@ def generate_assistant(stage, history, last_user="", essay="", round_num=1, prev
     # 万一模型自己附了标注（旧格式），先剥掉，确保不泄漏到学生端
     text, leaked_strategy, leaked_wrap = parse_meta(text)
     # 清掉开头套话（“你提到”“我想问一下”等），提示词压不住，生成后确定性替换
-    text = clean_ai_tics(text, is_opening)
+    text = clean_ai_tics(text, is_opening, keep_leadin=bool(help_type))
+    # 2) 防代写：命中就重生成（最多 2 次）。提示词禁不住，这是唯一的硬约束。
+    #    求助回合标准更严（学生正要说"我不知道"，此时替他定义＝敷衍）。
+    #    收尾回合不管——梳理对话时提到学生的句子不算代写，误伤代价更大。
+    if not (wrap_mode in ("now", "after") or stage0_wrap):
+        for _ in range(2):
+            bad = check_no_ghostwriting(text, help_mode=bool(help_type))
+            if not bad:
+                break
+            api_history = api_history + [(
+                "user",
+                "【上一条回复作废】它里面出现了替学生提供材料或直接给答案的话术（%s）。"
+                "学生答不出他的论证，是因为你没把话说出来；他说“我不知道”，是因为你真的说清楚了。"
+                "请重写这一回合：**只给抓手，不给答案**——"
+                "抓手只能是他自己作文里写下的句子，或者教材的篇名。"
+                "不许出现任何具体的定义、例子、名句、情节、范文。"
+                % bad[:20])]
+            try:
+                text = call_zhipu(system_prompt, api_history)
+            except Exception:
+                break
+            text, _, _ = parse_meta(text)
+            text = clean_ai_tics(text, is_opening, keep_leadin=bool(help_type))
     # 收尾由后端判定驱动：这一回合就是收尾回合，策略固定记「回顾看」
-    if wrap_mode in ("now", "after"):
+    if wrap_mode in ("now", "after") or stage0_wrap:
         return text, "回顾看", True
+    # 求助回合不该收尾：学生还没补上，判定说收也不收（防止他喊一声不会就跳过整组对话）
+    if help_type:
+        return text, "", False
     # 研究字段：独立判定本回合的引导策略与是否收尾
     strategy, judged_wrap = judge_turn(last_user, text)
     if not strategy and leaked_strategy:
@@ -750,9 +1239,12 @@ def generate_assistant(stage, history, last_user="", essay="", round_num=1, prev
     return text, strategy, wrap
 
 
-def ensure_round_conversation(student_id, essay=""):
+def ensure_round_conversation(student_id, essay="", topic="", material=""):
     """确保该生在当前轮次有一个对话：有则复用，无则按规则新建（含自动开场白）。
-    返回 (conv_id, essay)。本轮**必须由学生提交本轮的作文**才能新建；未提交则返回 (None, '')。"""
+    返回 (conv_id, essay)。本轮**必须由学生提交本轮的作文**才能新建；未提交则返回 (None, '')。
+
+    topic/material：作文题目与材料（老师需求①第一版）。只在该轮首次建对话时写入。
+    """
     round_num = get_active_round()
     stage = ROUND_STAGE.get(round_num, 1)
     conn = get_db()
@@ -776,9 +1268,10 @@ def ensure_round_conversation(student_id, essay=""):
     # 第2轮：先取第1轮原稿（写事务之前查，避免与未提交的写操作抢锁）
     prev_essay = get_prev_essay(student_id, round_num)
     cur = conn.execute(
-        "INSERT INTO conversations(student_id, round, stage, essay, draft_type, created_at) "
-        "VALUES(?,?,?,?,?,?)",
-        (student_id, round_num, stage, base_essay, draft_type, now_str()))
+        "INSERT INTO conversations(student_id, round, stage, essay, draft_type, "
+        "topic, material, created_at) VALUES(?,?,?,?,?,?,?,?)",
+        (student_id, round_num, stage, base_essay, draft_type,
+         topic, material, now_str()))
     conv_id = cur.lastrowid
     hist_rows = conn.execute(
         "SELECT role, content FROM messages m JOIN conversations c "
@@ -789,7 +1282,8 @@ def ensure_round_conversation(student_id, essay=""):
         opening, strategy, _ = generate_assistant(1, history_ctx, essay=base_essay,
                                                   round_num=round_num,
                                                   prev_essay=prev_essay,
-                                                  is_opening=True)
+                                                  is_opening=True,
+                                                  topic=topic, material=material)
     else:
         opening = STAGE2_OPENING
         strategy = "回顾看"
@@ -849,6 +1343,8 @@ def start():
     name = (request.form.get("name") or "").strip()
     sid = (request.form.get("sid") or "").strip()
     essay = (request.form.get("essay") or "").strip()
+    topic = (request.form.get("topic") or "").strip()      # 作文题目（老师需求①）
+    material = (request.form.get("material") or "").strip()  # 材料／写作要求
     if not name:
         return jsonify({"error": "请填写姓名"}), 400
     conn = get_db()
@@ -876,7 +1372,7 @@ def start():
                          "AI 要读完整篇，才能找到你论证里的问题。" % MIN_ESSAY_LEN}), 400
 
     # 按轮次分对话：复用 ensure_round_conversation（与首页刷新同一条逻辑）
-    conv_id, essay = ensure_round_conversation(student_id, essay)
+    conv_id, essay = ensure_round_conversation(student_id, essay, topic, material)
     if conv_id is None:
         return jsonify({"error": "请先粘贴你本轮的作文，再开始对话"}), 400
 
@@ -895,6 +1391,89 @@ def start():
                     "stage": stage, "round": round_num})
 
 
+@app.route("/start_prompt", methods=["POST"])
+def start_prompt():
+    """阶段 0 · 审题对话（老师需求①第二版）：只交题目＋材料＋立意，不用写作文。
+
+    独立于 /start 的一条入口：阶段 0 存在 round=0，stage=0，与写作轮次分开，
+    这样第1轮的前测作文仍然干净（审题过程不会污染第1轮的对话记录）。
+    """
+    name = (request.form.get("name") or "").strip()
+    topic = (request.form.get("topic") or "").strip()
+    material = (request.form.get("material") or "").strip()
+    idea = (request.form.get("idea") or "").strip()
+    if not name:
+        return jsonify({"error": "请填写姓名"}), 400
+    if not topic:
+        return jsonify({"error": "请填写作文题目——审题得先有题目"}), 400
+    conn = get_db()
+    stu = conn.execute("SELECT id FROM students WHERE name=?", (name,)).fetchone()
+    if stu:
+        student_id = stu["id"]
+    else:
+        cur = conn.execute("INSERT INTO students(name, created_at) VALUES(?,?)",
+                           (name, now_str()))
+        student_id = cur.lastrowid
+    conn.commit()
+    # 阶段 0 每人只建一次：已有记录就直接载回，不重复建
+    conv = conn.execute(
+        "SELECT id FROM conversations WHERE student_id=? AND round=0 LIMIT 1",
+        (student_id,)).fetchone()
+    if conv:
+        conv_id = conv["id"]
+    else:
+        cur = conn.execute(
+            "INSERT INTO conversations(student_id, round, stage, essay, draft_type, "
+            "topic, material, created_at) VALUES(?,?,?,?,?,?,?,?)",
+            (student_id, 0, 0, "", "审题", topic, material, now_str()))
+        conv_id = cur.lastrowid
+        opening = STAGE0_OPENING
+        conn.execute(
+            "INSERT INTO messages(conversation_id, role, content, strategy, created_at) "
+            "VALUES(?,?,?,?,?)",
+            (conv_id, "assistant", opening, "", now_str()))
+        # 学生的初始立意作为第一条消息存下来（AI 要看到，才知道他自己的理解偏在哪）
+        if idea:
+            conn.execute(
+                "INSERT INTO messages(conversation_id, role, content, strategy, created_at) "
+                "VALUES(?,?,?,?,?)",
+                (conv_id, "user", idea, "", now_str()))
+        conn.commit()
+    conn.close()
+    session["student_id"] = student_id
+    session["student_name"] = name
+    session["conv_id"] = conv_id
+    session["stage0"] = True
+    conn2 = get_db()
+    rows = conn2.execute(
+        "SELECT role, content, strategy FROM messages WHERE conversation_id=? ORDER BY id",
+        (conv_id,)).fetchall()
+    conn2.close()
+    return jsonify({"ok": True, "stage": 0, "round": 0, "topic": topic,
+                    "history": [{"role": r["role"], "content": r["content"],
+                                 "strategy": r["strategy"]} for r in rows]})
+
+
+@app.route("/finish_prompt", methods=["POST"])
+def finish_prompt():
+    """结束审题、回到写作轮次。学生带着他自己的审题笔记进入第1轮。"""
+    if "student_id" not in session:
+        return jsonify({"error": "请先填写姓名开始对话"}), 400
+    note = (request.form.get("note") or "").strip()
+    if len(note) < 10:
+        return jsonify({"error": "先把审题笔记写下来（不少于 10 字）——"
+                                 "这一步得你自己写，我不替你填"}), 400
+    sid = session["student_id"]
+    conn = get_db()
+    conn.execute("INSERT INTO messages(conversation_id, role, content, strategy, created_at) "
+                 "VALUES(?,?,?,?,?)",
+                 (session.get("conv_id"), "user", "【我的审题笔记】" + note, "", now_str()))
+    conn.commit()
+    conn.close()
+    session.pop("stage0", None)
+    return jsonify({"ok": True, "next": "/"})
+
+
 @app.route("/chat", methods=["POST"])
 def chat():
     if "student_id" not in session or "conv_id" not in session:
@@ -905,11 +1484,13 @@ def chat():
     conv_id = session["conv_id"]
     conn = get_db()
     conv = conn.execute(
-        "SELECT round, stage, essay, student_id FROM conversations WHERE id=?",
+        "SELECT round, stage, essay, student_id, topic, material FROM conversations WHERE id=?",
         (conv_id,)).fetchone()
     round_num = conv["round"]
     stage = conv["stage"]
     essay = conv["essay"] or ""
+    topic = conv["topic"] or ""
+    material = conv["material"] or ""
     # 第2轮：取第1轮原稿做对照（每个来回都注入，保证全程都能对照原稿判断断裂点是否补上）
     prev_essay = get_prev_essay(conv["student_id"], round_num) if stage == 1 else ""
     # 取历史
@@ -951,11 +1532,53 @@ def chat():
     wrap_mode = "after" if already_wrapped else ""
     next_point = ""
     point_repeat = 0
-    if stage == 1 and not already_wrapped:
+    help_type = ""
+    prev_question = ""
+    stage0_wrap = False
+    tail = ""
+    # ---- 求助判定**必须最先做** ----
+    # 踩过的坑：只要先判定了断裂点、就近约束就会把追问方向绑死，学生说什么都
+    # 影响不了它——实测学生连说三次求助（"你直接告诉我""你还没回答我""举个例子"），
+    # 系统三次都当没听见。所以求助判定排在 judge_point 之前。
+    if not already_wrapped:
         tail = "\n".join(
             ("AI：" if r["role"] == "assistant" else "学生：") + (r["content"] or "")[:300]
             for r in rows[-6:])
         tail += "\n学生：" + user_text[:300]
+        help_type = judge_help_request(user_text, tail)
+    if help_type == "repeat":
+        # 重复未答：抓手给**上一轮**那个点，point 沿用上一轮。
+        # 不消耗"同点已追两轮"的配额——他没补上，不是我追多了。
+        prev_qs = [r["content"] for r in rows
+                   if r["role"] == "assistant" and r["content"]]
+        prev_question = prev_qs[-1] if prev_qs else ""
+        last_pts = [r["point"] for r in rows if r["role"] == "assistant" and r["point"]]
+        next_point = last_pts[-1] if last_pts else ""
+        # 连续两个 repeat 都指向同一个点 → 强制换点，避免又变成原地打转
+        if len(last_pts) >= 2 and last_pts[-1] == last_pts[-2]:
+            for p in POINT_ORDER:
+                if p == "元认知反思缺失" or p not in last_pts:
+                    next_point = p
+                    break
+        wrap_mode = ""      # 求助回合一律不收尾
+        point_repeat = 0     # 不消耗配额
+    elif help_type == "direct":
+        # 直接求助：不追新断裂点，但仍要知道"当前在追哪个点"——抓手要指向那里。
+        # point 照常写入、照常计入"同点已追两轮"（防永久降档：降低的是这一回合
+        # 的问题难度，不是整个对话的难度）。
+        turns = len([r for r in rows if r["role"] == "user"]) + 1
+        asked_points = [r["point"] for r in rows if r["point"]]
+        next_point = judge_point(essay, tail, asked_points)
+        if next_point == "元认知反思缺失":
+            next_point = asked_points[-1] if asked_points else ""
+        wrap_mode = ""
+        point_repeat = asked_points.count(next_point) if next_point else 0
+    elif stage == 0:
+        # 阶段 0（审题）：只聊概念辨析，聊够了就收束产审题笔记。
+        # 判定很简单——他有没有把"不是什么"和边界案例说出来。
+        turns0 = len([r for r in rows if r["role"] == "user"]) + 1
+        stage0_wrap = turns0 >= 2 and _stage0_concepts_clear(user_text)
+    elif stage == 1 and not already_wrapped:
         turns = len([r for r in rows if r["role"] == "user"]) + 1
         # 已经追过哪些断裂点（内部推进用，不参与研究编码）
         asked_points = [r["point"] for r in rows if r["point"]]
@@ -981,20 +1604,27 @@ def chat():
             # 追问方向判定失败时才回落用收尾判定兜底，省一次调用
             wrap_mode = "now"
     # 生成 AI 回复
-    text, strategy, should_wrap = generate_assistant(stage, history, raw_user, essay,
-                                                    round_num, prev_essay,
-                                                    wrap_mode, next_point=next_point,
-                                                    point_repeat=point_repeat)
+    text, strategy, should_wrap = generate_assistant(
+        stage, history, raw_user, essay, round_num, prev_essay, wrap_mode,
+        next_point=next_point, point_repeat=point_repeat,
+        help_type=help_type, topic=topic, material=material,
+        prev_question=prev_question, stage0_wrap=stage0_wrap)
+    # 求助回合的 point 记录口径：
+    #   direct = 本回合追的点照常写入（计入配额，防永久降档）
+    #   repeat = 沿用上一轮的点（他没补上，不是我追多了）——但仍要写，方便复核
+    # 求助回合 strategy 留空：它不是六策略里的任何一种，是教学应变。
     conn.execute(
-        "INSERT INTO messages(conversation_id, role, content, strategy, point, created_at) "
-        "VALUES(?,?,?,?,?,?)",
+        "INSERT INTO messages(conversation_id, role, content, strategy, point, "
+        "help_type, created_at) VALUES(?,?,?,?,?,?,?)",
         (conv_id, "assistant", text, strategy,
-         next_point or ("元认知反思缺失" if wrap_mode == "now" else None), now_str()))
+         next_point or ("元认知反思缺失" if wrap_mode == "now" else None),
+         help_type or None, now_str()))
     conn.commit()
     conn.close()
     # 收尾状态：模型判定该收尾（末尾标注 @@收尾=是@@）、或此前已收尾
     wrapped = bool(should_wrap or already_wrapped or strategy == "回顾看")
-    return jsonify({"reply": text, "strategy": strategy, "wrapped": wrapped})
+    return jsonify({"reply": text, "strategy": strategy, "wrapped": wrapped,
+                    "help": help_type})
 
 
 @app.route("/history")
@@ -1132,20 +1762,28 @@ def admin_export():
     conn = get_db()
     rows = conn.execute(
         "SELECT s.name, s.sid, c.round, c.stage, c.draft_type, c.created_at AS conv_time, "
-        "m.role, m.strategy, m.content, m.created_at "
+        "c.topic, c.material, "
+        "m.role, m.strategy, m.content, m.created_at, m.help_type "
         "FROM messages m JOIN conversations c ON m.conversation_id=c.id "
         "JOIN students s ON c.student_id=s.id ORDER BY s.id, c.id, m.id").fetchall()
     conn.close()
     output = io.StringIO()
     writer = csv.writer(output)
-    writer.writerow(["姓名", "学号", "轮次", "稿次", "阶段", "对话开始时间", "角色",
-                     "使用/引导策略", "图尔敏断裂点", "内容", "消息时间"])
+    writer.writerow(["姓名", "学号", "轮次", "稿次", "阶段", "作文题目", "材料/写作要求",
+                     "对话开始时间", "角色", "使用/引导策略", "图尔敏断裂点",
+                     "是否求助回合", "内容", "消息时间"])
+    # 求助回合（direct/repeat）不是六策略里的任何一种，策略列留空，
+    # 另设一列单独记——它只用于描述性统计，**不参与断裂点编码**。
+    help_label = {"direct": "是·要答案/说不会", "repeat": "是·未被回答"}
     for r in rows:
         toulmin = TOULMIN_MAP.get(r["strategy"], "") if r["strategy"] else ""
         writer.writerow([r["name"], r["sid"] or "", r["round"], r["draft_type"] or "",
-                         r["stage"], r["conv_time"],
+                         r["stage"], r["topic"] or "", r["material"] or "",
+                         r["conv_time"],
                          "学生" if r["role"] == "user" else "AI",
-                         r["strategy"] or "", toulmin, r["content"], r["created_at"]])
+                         r["strategy"] or "", toulmin,
+                         help_label.get(r["help_type"] or "", ""),
+                         r["content"], r["created_at"]])
     data = "\ufeff" + output.getvalue()
     return Response(
         data.encode("utf-8"),

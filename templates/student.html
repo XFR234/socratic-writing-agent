@@ -35,6 +35,25 @@
   .btn-primary:active { background:#8c5e2d; transform:scale(.98); }
   .hint { font-size:12.5px; color:#a89878; margin-top:10px; line-height:1.5; }
 
+  /* 必填标记与字段分组（许总 10-03：统一星号、标清两个入口各要填什么） */
+  .star { color:#b23a2e; font-weight:700; }
+  .req-legend { font-size:12.5px; color:#a89878; margin:0 0 2px; line-height:1.6; }
+  .field-group { border:1px solid transparent; border-radius:12px;
+                 padding:0 10px 12px; margin:12px -10px 0; transition:background .15s, border-color .15s; }
+  .field-group.hl { background:#fdf7ea; border-color:#e3cf9f; }
+  .group-head { display:flex; align-items:center; gap:7px; flex-wrap:wrap; padding:10px 0 0; }
+  .group-title { font-size:13.5px; font-weight:600; color:#8a6a2a; }
+  .badge { font-size:11px; padding:2px 9px; border-radius:999px; white-space:nowrap; line-height:1.6; }
+  .badge-both   { background:#fdf0da; color:#9a6a20; border:1px solid #eed9b0; }
+  .badge-chat   { background:#eef3f6; color:#4a6b7c; border:1px solid #d8e4ea; }
+  .badge-prompt { background:#eef4fb; color:#3b6fd4; border:1px solid #d7e6f5; }
+  .badge-optional { background:#f2efe8; color:#9a8a64; border:1px solid #e6e0d2; }
+  .label-row { display:flex; align-items:center; gap:6px; flex-wrap:wrap; margin:12px 0 5px; }
+  .label-row label { margin:0; }
+  .req-note { font-size:12.5px; color:#a89878; margin-top:7px; line-height:1.55; }
+  .req-note b { color:#8a6a2a; font-weight:600; }
+  .missing { border-color:#d9534f !important; box-shadow:0 0 0 3px rgba(217,83,79,.13) !important; }
+
   /* 对话区 */
   .chat-card { flex:1; display:flex; flex-direction:column; padding:0; overflow:hidden; }
   .topbar { display:flex; justify-content:space-between; align-items:center; padding:10px 12px; border-bottom:1px solid #ece0c4; }
@@ -128,43 +147,77 @@
   <div class="main">
     <!-- 登录/开始 -->
     <div id="startBox" class="card form {% if logged_in %}hidden{% endif %}">
-      <label>姓名 *</label>
-      <input id="name" placeholder="请输入你的姓名">
-      <label>学号（选填）</label>
-      <input id="sid" placeholder="选填">
-      <div id="topicBox">
-        <label>作文题目 <b style="color:#b23a2e">*</b></label>
-        <input id="topic" placeholder="例如：学以成人">
-        <label>材料／写作要求 <b style="color:#b23a2e">*</b></label>
-        <textarea id="material" style="min-height:70px" placeholder="把题目下面的材料、写作要求或者提示语贴上来。填了之后，苏格拉底才知道你这篇该不该扣题、你把题目里的关键词读准了没有。"></textarea>
-        <div class="hint">这两项<b>都要填</b>。题目里往往藏着两三个关键词（比如"学以成人"里的"学"和"成人"），绝大多数同学的问题不是跑题，而是把它们读窄了——只有他看见题目，才挑得出这个问题。</div>
+      <div class="req-legend">带 <b class="star">*</b> 的为必填项；没标星的可不填。</div>
+
+      <!-- ① 学生信息 -->
+      <div class="field-group">
+        <div class="group-head"><span class="group-title">① 你是谁</span></div>
+        <div class="label-row"><label for="name">姓名 <b class="star">*</b></label></div>
+        <input id="name" placeholder="请输入你的姓名">
+        <div class="label-row"><label for="sid">学号</label><span class="badge badge-optional">选填</span></div>
+        <input id="sid" placeholder="不填也可以">
       </div>
-      <div id="essayBox">
+
+      <!-- ② 题目与材料：两个入口都需要 -->
+      <div id="topicBox" class="field-group">
+        <div class="group-head">
+          <span class="group-title">② 这道题</span>
+          <span class="badge badge-both">两个按钮都要填</span>
+        </div>
+        <div class="label-row"><label for="topic">作文题目 <b class="star">*</b></label></div>
+        <input id="topic" placeholder="例如：学以成人">
+        <div class="label-row"><label for="material">材料／写作要求 <b class="star">*</b></label></div>
+        <textarea id="material" style="min-height:70px" placeholder="把题目下面的材料、写作要求或者提示语贴上来。苏格拉底要靠它才知道你这篇该不该扣题、你把题目里的关键词读准了没有。"></textarea>
+        <div class="hint">题目里往往藏着两三个关键词（比如"学以成人"里的"学"和"成人"），绝大多数同学的问题不是跑题，而是把它们读窄了——只有他看见题目和材料，才挑得出这个问题。</div>
+      </div>
+
+      <!-- ③ 作文：只有「开始对话」需要 -->
+      <div id="essayBox" class="field-group">
+        <div class="group-head">
+          <span class="group-title">③ 你的作文</span>
+          <span class="badge badge-chat">只有「开始对话」要填</span>
+        </div>
         {% if draft_type == '升格稿' %}
-        <label>粘贴你<b>修改后的升格稿</b>（<b>必填</b>）</label>
+        <div class="label-row"><label>粘贴你<b>修改后的升格稿</b> <b class="star">*</b></label></div>
         <textarea id="essay" placeholder="把你在第1轮对话之后改出来的那一稿完整粘贴进来（与第1轮同一篇作文的修改版，不少于 {{ min_essay_len }} 字）。第1轮的原稿和对话记录可在右上角「往期对话」里回看。"></textarea>
         <div class="hint">这一轮苏格拉底会<b>对照你第1轮的稿子</b>再看一遍：上次追问你的那个问题，你补上了没有？</div>
         {% else %}
-        <label>粘贴你<b>本轮</b>的作文（<b>必填</b>）</label>
+        <div class="label-row"><label>粘贴你<b>本轮</b>的作文 <b class="star">*</b></label></div>
         <textarea id="essay" placeholder="把这一轮的作文完整粘贴进来（整篇或完整的段落，不少于 {{ min_essay_len }} 字）。只写一句观点不够——AI 要读完整篇，才能找到你论证里的问题。"></textarea>
         {% endif %}
       </div>
+
+      <div style="margin-top:20px">
+        <button id="btnChat" class="btn btn-primary" style="width:100%"
+                onclick="startChat()"
+                onmouseenter="hlFields('chat')" onmouseleave="hlFields(null)"
+                ontouchstart="hlFields('chat')">开始对话</button>
+        <div class="req-note">要填：<b>姓名</b> + <b>作文题目</b> + <b>材料／写作要求</b> + <b>作文</b>（不少于 {{ min_essay_len }} 字）</div>
+      </div>
+
       <div style="margin-top:16px">
-        <button class="btn btn-primary" onclick="startChat()">开始对话</button>
+        <button id="btnPrompt" class="btn" style="width:100%;background:#fff;color:#8a6a2a;border:1px solid #d9c9a3"
+                onclick="showPromptBox()"
+                onmouseenter="hlFields('prompt')" onmouseleave="hlFields(null)"
+                ontouchstart="hlFields('prompt')">先做审题 · 概念辨析（不用写作文）</button>
+        <div class="req-note">要填：<b>姓名</b> + <b>作文题目</b> + <b>材料／写作要求</b>（不用写作文）</div>
       </div>
-      <div style="margin-top:10px">
-        <button class="btn" style="background:#fff;color:#8a6a2a;border:1px solid #d9c9a3" onclick="showPromptBox()">先做审题 · 概念辨析（不用写作文）</button>
-      </div>
-      <div id="promptBox" class="form hidden" style="margin-top:14px;padding:14px;border:1px dashed #d9c9a3;border-radius:8px">
-        <div class="hint" style="margin-bottom:10px">审题阶段只做一件事：把题目的核心概念说准。不用写作文，也不会有标准答案给你。</div>
-        <label>作文题目 <b style="color:#b23a2e">*</b></label>
+
+      <div id="promptBox" class="form hidden" style="margin-top:16px;padding:14px;border:1px dashed #d9c9a3;border-radius:10px">
+        <div class="group-head" style="padding-top:0">
+          <span class="group-title">审题入口</span>
+          <span class="badge badge-prompt">只用这道题的题目和材料</span>
+        </div>
+        <div class="hint" style="margin:8px 0 10px">审题阶段只做一件事：把题目的核心概念说准。不用写作文，也不会有标准答案给你。</div>
+        <div class="label-row"><label for="p_topic">作文题目 <b class="star">*</b></label></div>
         <input id="p_topic" placeholder="例如：学以成人">
-        <label>材料／写作要求 <b style="color:#b23a2e">*</b></label>
+        <div class="label-row"><label for="p_material">材料／写作要求 <b class="star">*</b></label></div>
         <textarea id="p_material" style="min-height:70px" placeholder="把材料贴上来。只有题目四个字没法审——审题要看的正是材料里有什么矛盾、困境、不合理的地方。"></textarea>
-        <label>你自己的初步想法（选填）</label>
+        <div id="p_carry" class="hint hidden">已按上面第②项自动填好，你可以在这里单独修改（只影响审题这次）。</div>
+        <div class="label-row"><label for="p_idea">你自己的初步想法</label><span class="badge badge-optional">选填</span></div>
         <textarea id="p_idea" style="min-height:60px" placeholder="你觉得这道题在问什么？先随便写，苏格拉底会抓着你的理解追问。"></textarea>
         <div style="margin-top:12px">
-          <button class="btn btn-primary" onclick="startPrompt()">开始审题</button>
+          <button class="btn btn-primary" style="width:100%" onclick="startPrompt()">开始审题</button>
         </div>
         <div id="p_chat" class="hidden" style="margin-top:14px"></div>
       </div>
@@ -301,29 +354,66 @@ if (initialHistory && initialHistory.length) {
   if (WRAPPED) showWrapped();
 }
 
+// 悬停按钮时高亮它需要填的字段（手机上点按也会触发一次）
+function hlFields(which) {
+  const map = { chat: ['topicBox', 'essayBox'], prompt: ['topicBox'] };
+  ['topicBox', 'essayBox'].forEach(id => {
+    const el = document.getElementById(id);
+    if (el) el.classList.remove('hl');
+  });
+  (map[which] || []).forEach(id => {
+    const el = document.getElementById(id);
+    if (el) el.classList.add('hl');
+  });
+  const pb = document.getElementById('promptBox');
+  if (pb && which === 'prompt' && !pb.classList.contains('hidden')) pb.style.borderColor = '#e3cf9f';
+  else if (pb) pb.style.borderColor = '#d9c9a3';
+}
+
+// 校验不通过时把页面滚到那个字段并标红，别只弹一句提示让学生自己找
+function focusField(el) {
+  if (!el) return;
+  hlFields(null);
+  el.classList.add('missing');
+  el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  try { el.focus({ preventScroll: true }); } catch (e) { el.focus(); }
+  setTimeout(() => el.classList.remove('missing'), 2600);
+}
+
 function startChat() {
+  // 学生若先在上面的第②项填过，这里兜一下，免得重复输入
+  const pTopic = document.getElementById('p_topic');
+  const pMat = document.getElementById('p_material');
+  const topicEl = document.getElementById('topic');
+  const matEl = document.getElementById('material');
+  if (pTopic && !topicEl.value.trim() && pTopic.value.trim()) topicEl.value = pTopic.value.trim();
+  if (pMat && !matEl.value.trim() && pMat.value.trim()) matEl.value = pMat.value.trim();
+
   const name = document.getElementById('name').value.trim();
-  if (!name) { alert('请填写姓名'); return; }
+  if (!name) { alert('请填写姓名'); focusField(document.getElementById('name')); return; }
   const sid = document.getElementById('sid').value.trim();
   const essay = document.getElementById('essay').value.trim();
-  const topic = document.getElementById('topic') ? document.getElementById('topic').value.trim() : '';
-  const material = document.getElementById('material') ? document.getElementById('material').value.trim() : '';
+  const topic = topicEl ? topicEl.value.trim() : '';
+  const material = matEl ? matEl.value.trim() : '';
   // 题目与材料必填（许总 10-03 定）：两个入口各自把材料交齐。
   // 理由对学生要说清，别只说"必填"——不然他随便敲四个字就完事。
   if (!topic) {
-    alert('请先填作文题目。\n'
+    alert('还差「作文题目」。\n'
         + '题目里通常藏着一两个关键词（比如“学以成人”里的“学”和“成人”），'
         + '苏格拉底要靠它判断你有没有把这些词读准。');
+    focusField(topicEl);
     return;
   }
   if (!material) {
-    alert('请把题目的材料／写作要求贴上来。\n'
+    alert('还差「材料／写作要求」。\n'
         + '没有材料，他只能从你的作文里猜这题要写什么，猜不准就追错方向。');
+    focusField(matEl);
     return;
   }
   if (essay.length < MIN_ESSAY_LEN) {
-    alert('请粘贴完整的作文（不少于 ' + MIN_ESSAY_LEN + ' 字）。\n'
+    alert('还差「作文」（不少于 ' + MIN_ESSAY_LEN + ' 字，现在 ' + essay.length + ' 字）。\n'
         + '只写一句观点不够——AI 要读完整篇，才能找到你论证里的问题。');
+    focusField(document.getElementById('essay'));
     return;
   }
   fetch('/start', {method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'},
@@ -345,7 +435,21 @@ function setInput(text) {
 
 // ============ 阶段 0：审题对话（概念辨析） ============
 function showPromptBox() {
-  document.getElementById('promptBox').classList.remove('hidden');
+  const box = document.getElementById('promptBox');
+  box.classList.remove('hidden');
+  hlFields('prompt');
+  // 第②项填过就自动带过来，学生不用填两遍；带过来了就明说一句
+  const src = [['topic', 'p_topic'], ['material', 'p_material']];
+  let carried = false;
+  src.forEach(([a, b]) => {
+    const from = document.getElementById(a), to = document.getElementById(b);
+    if (from && to && !to.value.trim() && from.value.trim()) {
+      to.value = from.value.trim(); carried = true;
+    }
+  });
+  const tip = document.getElementById('p_carry');
+  if (carried) tip.classList.remove('hidden');
+  box.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
 }
 function addPMsg(who, text) {
   const box = document.getElementById('p_chat');
@@ -366,14 +470,19 @@ function addPMsg(who, text) {
 }
 function startPrompt() {
   const name = document.getElementById('name').value.trim();
-  if (!name) { alert('请先填写姓名'); return; }
+  if (!name) { alert('请先填写姓名'); focusField(document.getElementById('name')); return; }
   const topic = document.getElementById('p_topic').value.trim();
-  if (!topic) { alert('请填写作文题目——审题得先有题目'); return; }
+  if (!topic) {
+    alert('还差「作文题目」——审题得先有题目');
+    focusField(document.getElementById('p_topic'));
+    return;
+  }
   const material = document.getElementById('p_material').value.trim();
   if (!material) {
-    alert('请把题目的材料／写作要求贴上来。\n'
+    alert('还差「材料／写作要求」。\n'
         + '审题要看的正是材料里有什么矛盾、困境、不合理的地方，'
         + '只有题目四个字没法审。');
+    focusField(document.getElementById('p_material'));
     return;
   }
   const idea = document.getElementById('p_idea').value.trim();

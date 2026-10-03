@@ -9,3 +9,5 @@ __pycache__/
 # 模拟对话的运行态文件（脚本与作文样例保留，状态与日志不入库）
 sim/sim_state.json
 sim/sim_log.jsonl
+# 本地版式预览产物（sim/render_preview.py 生成，仅供肉眼核对，不入库）
+preview_start.html

@@ -406,20 +406,30 @@ def clean_ai_tics(text, is_opening=False, keep_leadin=False):
     # 引用式：只在开头这一小段里找（正文中间的"你提到的那个例子"是正常指代，不动）
     for t in sorted(TIC_OPENERS, key=len, reverse=True):
         idx = out.find(t, 0, 40)
-        if idx >= 0:
-            # 保护：命中处后面紧跟虚词时，多半是"你提到过的""你说过的话"这类
-            # 正常指代，不是套话（实测把"你提到过的那句话"吃成"过的那句话"）。
-            after = out[idx + len(t):idx + len(t) + 1]
-            if after in ("过", "的", "那", "呢", "，"):
-                continue
-        if idx >= 0:
-            rest = (out[:idx] + out[idx + len(t):]).lstrip("，,、：: ")
-            if is_opening and idx == 0 and rest[:1] in ("“", "‘", "\""):
-                rest = "你在作文里写" + rest
-            rest = re.sub(r"[，,、]{2,}", "，", rest)      # 删掉插入语后可能留下连着的逗号
-            rest = re.sub(r"([。！？；])\1+", r"\1", rest)
-            out = rest
-            break
+        if idx < 0:
+            continue
+        after = out[idx + len(t):idx + len(t) + 1]
+        # 保护：命中处后面紧跟虚词时，多半是"你提到过的""你说过的话"这类
+        # 正常指代，不是套话（实测把"你提到过的那句话"吃成"过的那句话"）。
+        if after in ("过", "的", "那", "呢"):
+            continue
+        # 【2026-10-07】旧版把"你在作文中提到，"也一并放过了（after=="，"就 continue），
+        # 结果它成了最高频的漏网套话——9 篇实测里重复出现。
+        # 但又不能直接删：删掉"这是他作文里写的"这个归属，追问就脱离了那篇作文
+        # （正是同一轮实测里刚修的"滑出作文"）。所以**改写成"你在作文里写"**。
+        if after in ("，", ",", "：", ":") and ("作文" in t or "文中" in t
+                                               or t.startswith("你提到")
+                                               or t.startswith("你在文中说")):
+            rest = out[:idx] + "你在作文里写" + out[idx + len(t):]
+        else:
+            rest = out[:idx] + out[idx + len(t):]
+        rest = rest.lstrip("，,、：: ")
+        if is_opening and idx == 0 and rest[:1] in ("“", "‘", "\""):
+            rest = "你在作文里写" + rest
+        rest = re.sub(r"[，,、]{2,}", "，", rest)      # 删掉插入语后可能留下连着的逗号
+        rest = re.sub(r"([。！？；])\1+", r"\1", rest)
+        out = rest
+        break
     # 垫话式：第一句问号之前的都清掉（一句话里塞两个也能清干净）
     q = out.find("？")
     seg, tail = (out[:q], out[q:]) if q >= 0 else (out, "")
@@ -578,9 +588,13 @@ def build_turn_nudge(stage, is_opening=False, last_user="", wrap_mode="", turn_n
         "4. 如果他答的还是含糊，说明上一轮问得太大了、他摸不着边——"
         "**换一个更小、更具体、他更容易接住的角度来撬**（缩到一个人物、一个情境、"
         "一组对比上），不要把那句质询再问一遍。他已经答明白的点就往前推进到下一个断裂点。\n"
-        "5. 不许用“你提到”“我想问一下”“能否具体说明”“换句话说”“从某种程度上”这类套话开头，"
-        "不许复述他的话、也不要引用作文里的原句当开场。\n"
-        "6. 回复说完就完了，不要附任何标注、括号说明、JSON 或记号。）")
+        "5. 不许用“你提到”“我想问一下”“能否具体说明”“换句话说”“从某种程度上”这类套话开头。"
+        "**作文里的原句可以引，但只能当这一问的靶子**（写成：你在作文里写的「……」），"
+        "不许拿它当寒暄式的开场。\n"
+        "6. **这一问要落回他自己的作文**：他这句如果只是泛泛讲道理、没提自己写的东西，"
+        "你就挑出他作文里的那一句，就着那一句问——把他拽回自己的文章。"
+        "**不许连续两轮都在抽象概念上打转**：离开这篇作文的追问，对他改这篇作文没用。\n"
+        "7. 回复说完就完了，不要附任何标注、括号说明、JSON 或记号。）")
 
 
 def call_zhipu(system_prompt, history, json_mode=False, temperature=0.6):
@@ -992,6 +1006,34 @@ def _stage0_wrap_ghost(text):
         return ""
     m = _STAGE0_WRAP_GHOST_RE.search(text)
     return m.group(0) if m else ""
+
+
+# 一回合最多允许几个问句。超过就是"三问过载"——学生不知道该答哪个，
+# 通常挑最好答的那个搪塞，追问等于白问。允许 2 个：一个主问 + 一个贴身的限定追问
+# （"兼听指什么？是仅仅指多听吗？"这种还读得通），到第 3 个就散了。
+MAX_QUESTIONS_PER_TURN = 3
+
+
+def count_questions(text):
+    """数这一条回复里有几个问句（中英文问号都算）。"""
+    if not text:
+        return 0
+    return text.count("？") + text.count("?")
+
+
+def trim_to_one_question(text):
+    """兜底：把连珠炮式的追问砍成第一个问句。
+
+    只在"重生成两次还是问了一堆"时动刀——截断会丢内容，但比甩三四个问题给学生强。
+    截完太短（<15 字）就放弃，免得切出一个光秃秃的残句。
+    """
+    if not text:
+        return text
+    pos = min([i for i in (text.find("？"), text.find("?")) if i >= 0] or [-1])
+    if pos < 0:
+        return text
+    kept = text[:pos + 1].strip()
+    return kept if len(kept) >= 8 else text
 
 
 # 阶段 0 的断点判定：这一轮该追概念辨析的哪一处。
@@ -1507,6 +1549,19 @@ def generate_assistant(stage, history, last_user="", essay="", round_num=1, prev
                         "请重写这一回合：**只给抓手，不给答案**——"
                         "抓手只能是他自己作文里写下的句子，或者教材的篇名。"
                         "不许出现任何具体的定义、例子、名句、情节、范文。" % bad[:20])
+                # 三问过载：提示词里禁过（"只问一个问题"），glm-4-flash 照犯不误，
+                # 实测 10 组里 9 组出现——这正是我们批评竞品的毛病，不能只靠提示词。
+                # 代写优先处理（性质更严重），没有代写再数问号。
+                if not bad:
+                    n_q = count_questions(text)
+                    if n_q >= MAX_QUESTIONS_PER_TURN:
+                        bad = "一次问了 %d 个问句" % n_q
+                        note = ("【上一条回复作废】你这一句里连着问了 %d 个问题。\n"
+                                "**一次只许问一个。** 学生看完三四个问句不知道该答哪个，"
+                                "通常就挑最好答的那个搪塞过去，追问等于没问。\n"
+                                "请重写：只留下**最要紧的那一个问题**，其余全部删掉，"
+                                "不要留「换句话说」「再问一句」这种补问，也不要把同一个意思"
+                                "换个说法再问一遍。整条回复就一问，说完就停。" % n_q)
             if not bad:
                 break
             api_history = api_history + [("user", note)]
@@ -1516,6 +1571,10 @@ def generate_assistant(stage, history, last_user="", essay="", round_num=1, prev
                 break
             text, _, _ = parse_meta(text)
             text = clean_ai_tics(text, is_opening, keep_leadin=bool(help_type) and stage != 0)
+    # 重生成两次还问一堆，就确定性截断到第一个问句——
+    # 宁可短一点，也不能把三四个问题一起甩给学生（他只会挑最好答的那个）。
+    if not (wrap_mode in ("now", "after")) and count_questions(text) >= MAX_QUESTIONS_PER_TURN:
+        text = trim_to_one_question(text)
     # 收尾由后端判定驱动：这一回合就是收尾回合，策略固定记「回顾看」
     if wrap_mode in ("now", "after") or stage0_wrap:
         return text, "回顾看", True

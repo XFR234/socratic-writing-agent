@@ -22,7 +22,12 @@ sys.path.insert(0, BASE)
 os.chdir(BASE)
 
 from app import (app, get_db, REASSURANCE_RE, LEADIN_PHRASES, TIC_OPENERS,  # noqa: E402
-                 EMPTY_PRAISE_RE, check_no_ghostwriting)
+                 EMPTY_PRAISE_RE, check_no_ghostwriting,
+                 count_questions, MAX_QUESTIONS_PER_TURN)
+
+# 锚定作文：这一问有没有落到学生自己的文章上（"你在作文里写的……"或直接出现"作文"）。
+# 全组不出现＝AI 顺着抽象概念聊，这篇作文等于白交了（许总 10-07 实测指出的问题）。
+ANCHOR_RE = re.compile(r"作文|你(?:在)?(?:这篇|那篇)?(?:文章|文中)|你写的")
 
 # 研究字段泄漏：学生不该看到这些内部术语
 LEAK_PATTERNS = [
@@ -90,8 +95,8 @@ def scan_reply(text, prev_text):
         issues.append("内部术语泄漏：「%s」" % m.group(0))
 
     # 6) 一次问太多（三问过载——这是批评竞品的点，自己不能犯）
-    q = text.count("？") + text.count("?")
-    if q >= 3:
+    q = count_questions(text)
+    if q >= MAX_QUESTIONS_PER_TURN:
         issues.append("一次问了 %d 个问句（三问过载）" % q)
 
     # 7) 与上一轮高度相似（原地打转的观感信号）
@@ -126,11 +131,15 @@ def main():
             wrapped = wrapped or (m["strategy"] == "回顾看")
 
     total = 0
+    anchored = 0
     for i, m in enumerate(ai_turns):
         prev_text = ai_turns[i - 1]["content"] if i else None
         issues = scan_reply(m["content"], prev_text)
         tag = "第%d轮" % (i + 1)
         pt = ("  · 追的点：%s" % points[i]) if points[i] else ""
+        if ANCHOR_RE.search(m["content"] or ""):
+            anchored += 1
+            pt += " 〔锚定作文〕"
         if issues:
             total += len(issues)
             print("\n[%s]%s" % (tag, pt))
@@ -162,8 +171,9 @@ def main():
 
     print("\n" + "-" * 68)
     print("AI 共 %d 轮，学生作答 %d 次，收尾：%s"
-          % (len(ai_turns), len([m for m in msgs if m["role"] == "user"]),
+          % (len(ai_turns), len([m for m in msgs if m["role"] == "user"],),
              "是" if wrapped else "否"))
+    print("锚定作文的轮次：%d / %d" % (anchored, len(ai_turns)))
     print("结论：" + ("全部通过 ✓" if total == 0 else "共 %d 处需要看" % total))
     print("（观感类问题可容忍；代写／泄漏／打转／不收尾这四类必须修）")
 

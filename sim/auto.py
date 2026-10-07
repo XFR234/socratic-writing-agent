@@ -38,17 +38,42 @@ def log(entry):
         f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
 
+def load_answers():
+    """学生应答序列：默认用内置的（贴合"学以成人"那篇）。
+
+    换作文时必须换应答——否则学生答的内容和作文无关，跑出来的追问看着正常，
+    其实是我们预设的答法把它引到了别处。
+    用法：python3 sim/auto.py --answers sim/cases/xx_answers.txt（一行一条）
+    """
+    path = None
+    for i, a in enumerate(sys.argv):
+        if a == "--answers" and i + 1 < len(sys.argv):
+            path = sys.argv[i + 1]
+            del sys.argv[i:i + 2]
+            break
+        if a.startswith("--answers="):
+            path = a.split("=", 1)[1]
+            del sys.argv[i]
+            break
+    if not path:
+        return ANSWERS
+    with open(path, encoding="utf-8") as f:
+        return [ln.strip() for ln in f if ln.strip() and not ln.startswith("#")]
+
+
 def main():
+    answers = load_answers()
     with open(STATE_PATH, encoding="utf-8") as f:
         st = json.load(f)
     conn = get_db()
     used = conn.execute("SELECT COUNT(*) c FROM messages WHERE conversation_id=? AND role='user'",
                         (st["conv_id"],)).fetchone()["c"]
     conn.close()
-    print("已有学生作答 %d 条，从第 %d 条继续" % (used, used + 1), flush=True)
+    print("已有学生作答 %d 条，从第 %d 条继续（应答共 %d 条）"
+          % (used, used + 1, len(answers)), flush=True)
 
-    for i in range(used, len(ANSWERS)):
-        ans = ANSWERS[i]
+    for i in range(used, len(answers)):
+        ans = answers[i]
         c = app.test_client()
         with c.session_transaction() as sess:
             sess["student_id"] = st["student_id"]

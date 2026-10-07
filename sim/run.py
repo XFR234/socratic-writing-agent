@@ -45,12 +45,47 @@ def log(entry):
         f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
 
-# 固定的题面：题目与材料自 2026-10-03 起必填，本地模拟跟着填一份，
-# 这样「关键词解读偏差」这一诊断在模拟里也能被跑到。
+# 默认题面：题目与材料自 2026-10-03 起必填。跑真实学生作文时**必须换成那一篇
+# 真题的题面**——AI 要靠它判断关键词有没有被读窄，拿别的题目糊上去等于测了个假的。
+# 换法二选一：
+#   ① 命令行：python3 sim/run.py start sim/cases/xx.txt --topic "题目" --material "材料"
+#   ② 文件头三行（推荐，题面跟着作文走，不会发错）：
+#        题目：……
+#        材料：……
+#        （空一行，下面是作文正文）
 SIM_TOPIC = "学以成人"
 SIM_MATERIAL = ("材料：一个人从出生到成人，成长中离不开学习。"
                 "有人以为学知识就够了，其实还要学做人、学会分辨是非。"
                 "学了却做错，知识越多错得越远。")
+
+
+def parse_case(path, topic=None, material=None):
+    """从作文文件里取出题目／材料／正文。
+
+    命令行传的 topic/material 优先；否则看文件头有没有「题目：」「材料：」；
+    都没有就用默认题面，并明确提示（免得跑完了才发现题面是错的）。
+    """
+    raw = open(path, encoding="utf-8").read().strip()
+    file_topic, file_material = None, None
+    body, in_head = [], True
+    for ln in raw.split("\n"):
+        s = ln.strip()
+        if in_head and (s.startswith("题目：") or s.startswith("题目:")):
+            file_topic = s.split("：", 1)[-1].split(":", 1)[-1].strip()
+            continue
+        if in_head and (s.startswith("材料：") or s.startswith("材料:")):
+            file_material = s.split("：", 1)[-1].split(":", 1)[-1].strip()
+            continue
+        if s == "" and in_head and not body:
+            continue        # 头部与正文之间的空行
+        in_head = False
+        body.append(ln)
+    essay = "\n".join(body).strip()
+    t = topic or file_topic or SIM_TOPIC
+    m = material or file_material or SIM_MATERIAL
+    if not (topic or file_topic):
+        print("[提示] 没拿到题目，用的是默认题面「%s」——跑真实作文请带上题面。" % t)
+    return t, m, essay
 
 
 def make_client(st):
@@ -63,14 +98,16 @@ def make_client(st):
     return c
 
 
-def do_start(essay_path):
-    with open(essay_path, encoding="utf-8") as f:
-        essay = f.read().strip()
+def do_start(essay_path, topic=None, material=None):
+    topic, material, essay = parse_case(essay_path, topic, material)
+    if len(essay) < 100:
+        print("作文太短（%d 字），后端要求不少于 100 字。" % len(essay))
+        return
     name = "模拟学生A"
     c = app.test_client()
     # 题目与材料必填（2026-10-03 起），这里跟着填一份固定的题面
     r = c.post("/start", data={"name": name, "sid": "SIM01", "essay": essay,
-                              "topic": SIM_TOPIC, "material": SIM_MATERIAL})
+                              "topic": topic, "material": material})
     data = r.get_json()
     if not data or not data.get("ok"):
         print("START FAILED:", r.status_code, data)
@@ -82,10 +119,12 @@ def do_start(essay_path):
         st["conv_id"] = sess.get("conv_id")
     save_state(st)
     log({"role": "essay", "content": essay})
+    log({"role": "case", "content": "题目：%s\n材料：%s" % (topic, material)})
     opening = data["history"][-1]["content"] if data.get("history") else ""
     log({"role": "assistant", "content": opening,
          "strategy": data["history"][-1].get("strategy") if data.get("history") else ""})
     print("== 轮次 %s / 阶段 %s ==" % (data.get("round"), data.get("stage")))
+    print("题目：%s｜材料：%s" % (topic, material[:40] + ("…" if len(material) > 40 else "")))
     print("[AI 开场]\n" + opening)
 
 
@@ -132,10 +171,24 @@ def do_reset():
     print("已重置（删掉状态、日志与模拟库）")
 
 
+def take_flag(name):
+    """取出 --topic "xxx" / --material "xxx" 这类可选参数（取走后从 argv 里删掉）。"""
+    for i, a in enumerate(sys.argv):
+        if a == "--" + name and i + 1 < len(sys.argv):
+            v = sys.argv[i + 1]
+            del sys.argv[i:i + 2]
+            return v
+        if a.startswith("--%s=" % name):
+            v = a.split("=", 1)[1]
+            del sys.argv[i]
+            return v
+    return None
+
+
 if __name__ == "__main__":
     cmd = sys.argv[1] if len(sys.argv) > 1 else ""
     if cmd == "start":
-        do_start(sys.argv[2])
+        do_start(sys.argv[2], take_flag("topic"), take_flag("material"))
     elif cmd == "reply":
         do_reply(sys.argv[2])
     elif cmd == "dump":

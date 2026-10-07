@@ -12,3 +12,5 @@ sim/sim_log.jsonl
 # 本地版式预览产物（sim/render_preview.py 生成，仅供肉眼核对，不入库）
 preview_start.html
 preview_stage0.html
+# 学生真实作文（含题面）只在本机跑模拟用，不入库——学生数据不进公开仓库
+sim/cases/

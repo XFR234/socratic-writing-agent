@@ -501,14 +501,32 @@ function startPrompt() {
     return;
   }
   const idea = document.getElementById('p_idea').value.trim();
-  fetch('/start_prompt', {method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'},
-    body:`name=${encodeURIComponent(name)}&topic=${encodeURIComponent(topic)}&material=${encodeURIComponent(material)}&idea=${encodeURIComponent(idea)}`})
-    .then(r=>r.json()).then(d=>{
-      if (d.error) { alert(d.error); return; }
-      // 服务端已记下"审题进行中"，重载一次即进入审题那一屏。
-      // 不在前端自己拼一套审题界面——界面状态只认服务端这一份，否则两套渲染迟早不同步。
-      location.reload();
-    });
+  postPrompt(false);
+
+  function postPrompt(newConv) {
+    let body = `name=${encodeURIComponent(name)}&topic=${encodeURIComponent(topic)}`
+      + `&material=${encodeURIComponent(material)}&idea=${encodeURIComponent(idea)}`;
+    if (newConv) body += '&new_conv=1';
+    fetch('/start_prompt', {method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'},
+      body: body})
+      .then(r=>r.json()).then(d=>{
+        if (d.error) { alert(d.error); return; }
+        // 已经在审另一道题了：先问清楚，不要偷偷把新题目丢掉
+        if (d.need_switch) {
+          const goNew = confirm(
+            '你已经在审《' + d.old_topic + '》了。\n'
+            + '这次提交的是《' + d.new_topic + '》。\n\n'
+            + '确定 ＝ 用这次这道题另开一轮审题（上一次仍可在「往期对话」里回看）\n'
+            + '取消 ＝ 回到《' + d.old_topic + '》继续审');
+          if (goNew) { postPrompt(true); return; }
+          location.reload();
+          return;
+        }
+        // 服务端已记下"审题进行中"，重载一次即进入审题那一屏。
+        // 不在前端自己拼一套审题界面——界面状态只认服务端这一份，否则两套渲染迟早不同步。
+        location.reload();
+      });
+  }
 }
 // 审题收尾：让他自己写审题笔记（不代写）。原先这段挂在表单里的 p_chat 上，
 // 现已并入主对话区，与写作轮共用同一块消息流。

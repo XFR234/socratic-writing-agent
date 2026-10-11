@@ -95,6 +95,42 @@ d6 = r.get_json()
 ck("返回 400 + 说明要重新粘作文", r.status_code == 400 and "整篇粘进来" in (d6.get("error") or ""),
    (d6.get("error") or "")[:40])
 
+print("\n== G 审题入口：换一道题重审 ==")
+# 审题是另一条入口（round=0），同样的问题同样要修：
+# 阶段 0 原先"每人只建一次"，换题再点「开始审题」会把新题目悄悄丢掉。
+cl = A.app.test_client()
+
+
+def post_prompt(topic, material, new_conv=False):
+    data = {"name": "审题自测", "topic": topic, "material": material, "idea": ""}
+    if new_conv:
+        data["new_conv"] = "1"
+    r = cl.post("/start_prompt", data=data)
+    return r.get_json()
+
+
+g1 = post_prompt("兼听则明", "材料一：听取不同意见……")
+ck("审题首次提交 ok", bool(g1.get("ok")) and g1.get("stage") == 0)
+g2 = post_prompt("学以成人", "材料二：一个人从出生到成人……")
+ck("换题后返回 need_switch", bool(g2.get("need_switch")))
+ck("带回了上一道题的题目", g2.get("old_topic") == "兼听则明", str(g2.get("old_topic")))
+conn = A.get_db()
+n0 = conn.execute("SELECT COUNT(*) c FROM conversations WHERE round=0").fetchone()["c"]
+conn.close()
+ck("未确认时不新建审题对话", n0 == 1, "实际 %d 条" % n0)
+g3 = post_prompt("学以成人", "材料二：一个人从出生到成人……", new_conv=True)
+ck("确认重审返回 ok", bool(g3.get("ok")))
+conn = A.get_db()
+rows0 = conn.execute(
+    "SELECT id, topic FROM conversations WHERE round=0 ORDER BY id").fetchall()
+conn.close()
+ck("审题变成 2 条", len(rows0) == 2, "实际 %d 条" % len(rows0))
+ck("第 2 条是新题", rows0[1]["topic"] == "学以成人", rows0[1]["topic"])
+html2 = cl.get("/").get_data(as_text=True)
+ck("刷新后停在新的审题那屏", "const STAGE0 = true" in html2 and "学以成人" in html2)
+g4 = post_prompt("学以成人", "材料二：一个人从出生到成人……")
+ck("同题再审不打扰", not g4.get("need_switch"))
+
 print("\n" + "-" * 60)
 bad = [n for n, ok in checks if not ok]
 print("共 %d 项，通过 %d，失败 %d" % (len(checks), len(checks) - len(bad), len(bad)))

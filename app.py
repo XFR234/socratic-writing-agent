@@ -1895,11 +1895,25 @@ def start_prompt():
                            (name, now_str()))
         student_id = cur.lastrowid
     conn.commit()
-    # 阶段 0 每人只建一次：已有记录就直接载回，不重复建
-    conv = conn.execute(
-        "SELECT id FROM conversations WHERE student_id=? AND round=0 LIMIT 1",
-        (student_id,)).fetchone()
+    # 明确要另审一题（前端确认过"换题重审"）
+    force_new = (request.form.get("new_conv") or "").strip() in ("1", "true", "yes")
+    # 阶段 0 每人只建一次：已有记录就直接载回，不重复建。
+    # 但换了一道题时不能静默复用——旧行为会把新题目和新材料悄悄丢掉，
+    # 学生点完"开始审题"看到的是上一道题的对话（许总 2026-10-11 反馈）。
+    conv = None if force_new else conn.execute(
+        "SELECT id FROM conversations WHERE student_id=? AND round=0 "
+        "ORDER BY id DESC LIMIT 1", (student_id,)).fetchone()
     if conv:
+        old = conn.execute(
+            "SELECT topic, material FROM conversations WHERE id=?",
+            (conv["id"],)).fetchone()
+        if old and (old["topic"] or "").strip() != topic:
+            conn.close()
+            return jsonify({
+                "need_switch": True,
+                "old_topic": (old["topic"] or "").strip() or "（上一道题）",
+                "new_topic": topic,
+            })
         conv_id = conv["id"]
     else:
         cur = conn.execute(

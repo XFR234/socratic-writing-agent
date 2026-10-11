@@ -149,6 +149,11 @@ def get_active_stage():
     return ROUND_STAGE.get(get_active_round(), 1)
 
 
+def _norm_essay(text):
+    """作文正文归一化：只比内容，不比排版（学生重粘一遍可能多了空行、全角空格）。"""
+    return re.sub(r"\s+", "", text or "")
+
+
 def has_round_conversation(student_id, round_num):
     """该生本轮是否已建过对话（已建则本轮不必再次提交作文）。"""
     conn = get_db()
@@ -1609,18 +1614,22 @@ def generate_assistant(stage, history, last_user="", essay="", round_num=1, prev
     return text, strategy, wrap
 
 
-def ensure_round_conversation(student_id, essay="", topic="", material=""):
+def ensure_round_conversation(student_id, essay="", topic="", material="",
+                              force_new=False):
     """确保该生在当前轮次有一个对话：有则复用，无则按规则新建（含自动开场白）。
     返回 (conv_id, essay)。本轮**必须由学生提交本轮的作文**才能新建；未提交则返回 (None, '')。
 
     topic/material：作文题目与材料（老师需求①第一版）。只在该轮首次建对话时写入。
+    force_new：明确要另开一篇时置 True（学生/老师确认过"换题重开"），不再复用本轮旧对话。
     """
     round_num = get_active_round()
     stage = ROUND_STAGE.get(round_num, 1)
     conn = get_db()
-    conv = conn.execute(
+    # 同一轮次可能出现多条对话（学生确认过"换题重开"），取最新的那条；
+    # 加 id DESC 兜底：created_at 只到秒，同秒建的两条要靠 id 分先后。
+    conv = None if force_new else conn.execute(
         "SELECT id, essay FROM conversations WHERE student_id=? AND round=? "
-        "ORDER BY created_at DESC LIMIT 1",
+        "ORDER BY created_at DESC, id DESC LIMIT 1",
         (student_id, round_num)).fetchone()
     if conv:
         if not essay and conv["essay"]:
@@ -1801,6 +1810,13 @@ def start():
 
     # 本轮尚未建对话时，必须提交**本轮**的作文（不接受只写一个观点）
     round_num = get_active_round()
+    # 明确要求另开一篇（前端确认过"换题重开"）——此时旧对话一律不复用，
+    # 所以作文同样要重新交，否则新对话没有可读的稿子。
+    force_new = (request.form.get("new_conv") or "").strip() in ("1", "true", "yes")
+    if force_new and (not essay or len(essay) < MIN_ESSAY_LEN):
+        return jsonify({
+            "error": "换一篇作文重开时，要把新的作文整篇粘进来（不少于 %d 字）。"
+                     "AI 读的是这一篇，不是上一篇。" % MIN_ESSAY_LEN}), 400
     if not has_round_conversation(student_id, round_num):
         if not essay:
             return jsonify({"error": "请先粘贴你本轮的作文，再开始对话"}), 400
@@ -1808,9 +1824,29 @@ def start():
             return jsonify({
                 "error": "请粘贴完整的作文（不少于 %d 字）。只写一句观点不够——"
                          "AI 要读完整篇，才能找到你论证里的问题。" % MIN_ESSAY_LEN}), 400
+    elif not force_new:
+        # 本轮已经有对话了，先看他这次交的是不是同一篇。
+        # 旧行为是直接复用旧对话、把新作文悄悄丢掉——学生以为提交成功了，
+        # 结果页面跳回上一篇的对话、AI 还在追上一篇，看起来就像"宕机"。
+        # 现在改成先问一句，让他自己选（正式收数据时题目固定，不会走到这里）。
+        conn = get_db()
+        old = conn.execute(
+            "SELECT topic, essay FROM conversations WHERE student_id=? AND round=? "
+            "ORDER BY created_at DESC, id DESC LIMIT 1", (student_id, round_num)).fetchone()
+        conn.close()
+        if old:
+            same_topic = (old["topic"] or "").strip() == topic
+            same_essay = _norm_essay(old["essay"]) == _norm_essay(essay) if essay else True
+            if not (same_topic and same_essay):
+                return jsonify({
+                    "need_switch": True,
+                    "old_topic": (old["topic"] or "").strip() or "（上一篇）",
+                    "new_topic": topic,
+                })
 
     # 按轮次分对话：复用 ensure_round_conversation（与首页刷新同一条逻辑）
-    conv_id, essay = ensure_round_conversation(student_id, essay, topic, material)
+    conv_id, essay = ensure_round_conversation(student_id, essay, topic, material,
+                                               force_new=force_new)
     if conv_id is None:
         return jsonify({"error": "请先粘贴你本轮的作文，再开始对话"}), 400
 
@@ -2130,14 +2166,15 @@ def history_list():
         return jsonify({"list": []})
     conn = get_db()
     rows = conn.execute(
-        "SELECT c.id, c.round, c.stage, c.draft_type, c.created_at, "
+        "SELECT c.id, c.round, c.stage, c.draft_type, c.created_at, c.topic, "
         "(SELECT content FROM messages WHERE conversation_id=c.id ORDER BY id LIMIT 1) "
         "AS first_msg FROM conversations c WHERE c.student_id=? "
         "ORDER BY c.created_at DESC, c.id DESC",
         (session["student_id"],)).fetchall()
     conn.close()
+    # 同一轮次可能有多条（学生确认过"换题重开"），带上题目才分得清哪条是哪篇。
     out = [{"conv_id": r["id"], "round": r["round"], "stage": r["stage"],
-            "draft_type": r["draft_type"] or "",
+            "draft_type": r["draft_type"] or "", "topic": r["topic"] or "",
             "created_at": r["created_at"], "preview": (r["first_msg"] or "")[:36]}
            for r in rows]
     return jsonify({"list": out})

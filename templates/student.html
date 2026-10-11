@@ -429,15 +429,34 @@ function startChat() {
     focusField(document.getElementById('essay'));
     return;
   }
-  fetch('/start', {method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'},
-    body:`name=${encodeURIComponent(name)}&sid=${encodeURIComponent(sid)}&essay=${encodeURIComponent(essay)}&topic=${encodeURIComponent(topic)}&material=${encodeURIComponent(material)}`})
-    .then(r=>r.json()).then(d=>{
-      if (d.error) { alert(d.error); return; }
-      document.getElementById('startBox').classList.add('hidden');
-      document.getElementById('chatBox').classList.remove('hidden');
-      renderHistory(d.history);
-      if (WRAPPED) showWrapped();
-    });
+  postStart(false);
+
+  function postStart(newConv) {
+    let body = `name=${encodeURIComponent(name)}&sid=${encodeURIComponent(sid)}`
+      + `&essay=${encodeURIComponent(essay)}&topic=${encodeURIComponent(topic)}`
+      + `&material=${encodeURIComponent(material)}`;
+    if (newConv) body += '&new_conv=1';
+    fetch('/start', {method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'},
+      body: body})
+      .then(r=>r.json()).then(d=>{
+        if (d.error) { alert(d.error); return; }
+        // 本轮已经在聊另一篇了：先问清楚，不要偷偷把新作文丢掉
+        if (d.need_switch) {
+          const goNew = confirm(
+            '你这一轮已经在聊《' + d.old_topic + '》了。\n'
+            + '这次提交的是《' + d.new_topic + '》。\n\n'
+            + '确定 ＝ 用这次这篇另开一轮对话（上一篇仍可在「往期对话」里回看）\n'
+            + '取消 ＝ 回到《' + d.old_topic + '》继续聊');
+          if (goNew) { postStart(true); return; }
+          location.reload();
+          return;
+        }
+        document.getElementById('startBox').classList.add('hidden');
+        document.getElementById('chatBox').classList.remove('hidden');
+        renderHistory(d.history);
+        if (WRAPPED) showWrapped();
+      });
+  }
 }
 
 function setInput(text) {
@@ -599,6 +618,7 @@ function loadHistoryList(){
       div.style.cssText = 'padding:10px 12px;border:1px solid #eef0f2;border-radius:10px;margin-bottom:8px;cursor:pointer;background:#fafbfc';
       div.innerHTML = '<div style="font-size:13px;color:#52606d">'+rname
                     + (item.draft_type && item.round !== 0 ? '（'+escapeHtml(item.draft_type)+'）' : '')
+                    + (item.topic ? '《'+escapeHtml(item.topic)+'》' : '')
                     + ' · 阶段'+item.stage+' · '+item.created_at+'</div>'
                     + '<div style="font-size:12px;color:#9aa5b1;margin-top:4px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">'+((item.preview||'').replace(/</g,'&lt;'))+'</div>';
       div.onclick = ()=>openHistory(item.conv_id);

@@ -1724,6 +1724,7 @@ def index():
     wrapped = False
     stage0 = False        # 是否正处于「阶段 0 · 审题对话」
     conv_id = None
+    cur_topic = ""        # 当前对话的题目（顶栏要显示，否则学生不知道自己在聊哪一篇）
     if logged_in and session.get("student_id"):
         student_id = session["student_id"]
         # 审题未结束 → 优先回到审题界面：这一屏只干一件事，别和写作表单混在一起
@@ -1746,6 +1747,12 @@ def index():
                 "SELECT role, content, strategy FROM messages "
                 "WHERE conversation_id=? ORDER BY id",
                 (conv_id,)).fetchall()
+            # 同一轮次可能有多条（换题重开），把题目显示出来，否则顶栏只写
+            # 「第1轮」、两条长得一模一样，学生分不清自己在哪一篇。
+            trow = conn.execute(
+                "SELECT topic FROM conversations WHERE id=?", (conv_id,)).fetchone()
+            if trow:
+                cur_topic = trow["topic"] or ""
             conn.close()
             history_messages = [{"role": r["role"], "content": r["content"],
                                  "strategy": r["strategy"]} for r in rows]
@@ -1760,6 +1767,7 @@ def index():
         round_num=get_active_round(),
         stage=get_active_stage(),
         stage0=stage0,
+        cur_topic=cur_topic,
         strategies=STRATEGY_INFO,
         strategy_order=STRATEGY_ORDER,
         stage2_order=__import__("prompts").STAGE2_CARD_ORDER,

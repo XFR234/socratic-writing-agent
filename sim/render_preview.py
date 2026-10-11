@@ -100,6 +100,7 @@ s0_checks = [
      and 'hidden' not in html_s0.split('id="chatBox"')[1][:40]),
     ("首页表单已收起", 'id="startBox" class="card form hidden"' in html_s0),
     ("徽标为「审题 · 概念辨析」", "审题 · 概念辨析" in html_s0),
+    ("审题徽标带上当前在审的题目", "审题 · 概念辨析《" in html_s0),
     ("前端标记 STAGE0=true", "const STAGE0 = true" in html_s0),
 ]
 print("->", out_s0)

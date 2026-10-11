@@ -239,10 +239,10 @@
       <div class="topbar">
         {% if logged_in or stage0 %}
           {% if stage0 %}
-            <span class="stage-badge">审题 · 概念辨析</span>
+            <span class="stage-badge">审题 · 概念辨析{% if cur_topic %}《{{ cur_topic }}》{% endif %}</span>
             <span id="progress" style="font-size:12px;color:#a89878;margin-left:10px">{% if wrapped %}审题已聊完{% endif %}</span>
           {% else %}
-            <span class="stage-badge">第{{ round_num }}轮 · {% if stage==1 %}虚拟论敌{% else %}逻辑顾问{% endif %}{% if draft_type %}（{{ draft_type }}）{% endif %}</span>
+            <span class="stage-badge">第{{ round_num }}轮 · {% if stage==1 %}虚拟论敌{% else %}逻辑顾问{% endif %}{% if draft_type %}（{{ draft_type }}）{% endif %}{% if cur_topic %}《{{ cur_topic }}》{% endif %}</span>
             {% if stage == 1 %}
               <span id="progress" style="font-size:12px;color:#a89878;margin-left:10px">{% if wrapped %}本组对话已结束{% endif %}</span>
             {% endif %}

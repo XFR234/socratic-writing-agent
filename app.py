@@ -7,6 +7,7 @@
 严格遵循开题报告：四轮行动研究，轮次(1-4)由教师后台设定，
 第1-2轮=阶段一（虚拟论敌，AI主动追问），第3-4轮=阶段二（逻辑顾问，学生用策略卡主动追问）。
 """
+import difflib
 import os
 import re
 from dotenv import load_dotenv
@@ -112,6 +113,11 @@ def init_db():
     # 本次作文题的题干（题目＋材料／写作要求），学生必填。
     # 没有它，AI 只看得到学生写了什么，看不出扣没扣题。
     ensure_column(conn, "conversations", "topic", "TEXT")
+    # 这一回合是不是"学生向你要材料"（求助回合）。
+    # 【2026-10-15】为什么非要落库：连着三次求助就该收了，否则 AI 一直在给抓手、
+    # 学生一直说"我不会"——截图里那组就是这么连问了四轮。
+    # 只靠当回合判定算不出"连着几次"，得看历史，所以要持久化。
+    ensure_column(conn, "messages", "help_type", "TEXT")
     conn.commit()
     conn.close()
 
@@ -332,6 +338,81 @@ def looks_like_help_request(text):
     return any(s in t for s in HELP_SIGNALS)
 
 
+# 【2026-10-15】学生抱怨"你一直在重复问"的信号词。
+# 截图里学生的原话就是「怎么又问我重复的问题」「我刚才说过了」——旧词表一条都没接住，
+# 于是 AI 同一处追了四轮。接住了不算本事（真正的兜底是下面那条与词表无关的配额检查），
+# 但至少这一句能把"他已经在抵触了"这个信息用上去。
+REPEAT_COMPLAINTS = (
+    "又问", "重复的问题", "问重复", "问了好几", "问了好几遍", "问过好几",
+    "说过了", "讲过了", "已经说过", "不是说过", "刚说过", "刚刚说过",
+    "我刚才不是说了", "我刚说了", "你绕", "一直在绕", "别绕", "答非所问",
+)
+
+
+def looks_like_repeat_complaint(text):
+    """他这句话是在抱怨"你又问同一个"，不是在作答。"""
+    t = (text or "").strip()
+    if not t or len(t) > 60:
+        return False
+    return any(s in t for s in REPEAT_COMPLAINTS)
+
+
+# 一回合最多允许几个问句。超过就是"三问过载"——学生不知道该答哪个，
+# 通常挑最好答的那个搪塞，追问等于白问。允许 2 个：一个主问 + 一个贴身的限定追问
+# （"兼听指什么？是仅仅指多听吗？"这种还读得通），到第 3 个就散了。
+MAX_QUESTIONS_PER_TURN = 3
+# 与本组上一条 AI 回复的最大相似度。超过就判"同一个问题换了个说法"，
+# 重生成。这是文本层的确定性判据，绕不开——断裂点判定失败、点换来换去都能绕过配额，
+# 但两句话像不像骗不了人。
+REPLY_SIMILARITY_MAX = 0.55
+
+
+def count_questions(text):
+    """数这一条回复里有几个问句（中英文问号都算）。"""
+    if not text:
+        return 0
+    return text.count("？") + text.count("?")
+
+
+def allowed_book_titles(essay="", extra=""):
+    """AI 这一回合可以提到的书名／篇名的白名单。
+
+    【2026-10-15】生成后的书名白名单。为什么需要它：求助回合要"给个抓手"，
+    抓手只该来自两个地方——教材索引里的篇目，或者他自己作文里写到的东西。
+    可模型为了给抓手，会随手牵出一个篇名来充当"你读过的某某"（实测在
+    "连说我想不出来"那一组里连着两轮都提了《竹林中》，即便线索里根本没给它）。
+    这类篇名学生未必真读过，他一句话都答不上来，对话就卡死在这里。
+    白名单＝教材索引里的篇目 ∪ 他作文里自己提到过的书名，不在名单里的一律重生成。
+
+    **边界要说清**：那一组里《竹林中》其实是他作文原文里写的，属于合法引用；
+    这条规则拦的不是"引用作文"，而是**凭空造引用**——来源必须有据可查。
+    
+    """
+    titles = set()
+    for it in textbook.load_textbook_index():
+        t = (it.get("篇目") or "").split("（")[0].strip()
+        if t:
+            titles.add(t)
+    for src in (essay or "", extra or ""):
+        titles.update(re.findall(r"《([^》]{1,16})》", src))
+    return titles
+
+
+def trim_to_one_question(text):
+    """兜底：把连珠炮式的追问砍成第一个问句。
+
+    只在"重生成两次还是问了一堆"时动刀——截断会丢内容，但比甩三四个问题给学生强。
+    截完太短就放弃，免得切出一个光秃秃的残句。
+    """
+    if not text:
+        return text
+    pos = min([i for i in (text.find("？"), text.find("?")) if i >= 0] or [-1])
+    if pos < 0:
+        return text
+    kept = text[:pos + 1].strip()
+    return kept if len(kept) >= 8 else text
+
+
 def topic_head(topic, limit=24):
     """从题干里只取「题目」那一行。
 
@@ -426,8 +507,11 @@ def build_help_nudge(last_user="", next_point="", textbook_hints=None,
         "挑出两三项、先说其中最明显的一项）。\n"
         + tb +
         "【红线——违反就等于替他写】\n"
-        "· **不许把答案说出来**：不许定义概念、不许写开头或段落、不许举例证、"
+        "· 不许把答案说出来：不许定义概念、不许写开头或段落、不许举例证、"
         "不许讲课文内容或名句。\n"
+        "· **引据必须有出处**：能提的书名／篇名只有两种——上面给的教材线索里的那一篇，"
+        "或者他自己作文里写到的那一句。除此之外不要牵出别的篇目来当“你读过的某某”，"
+        "（他不熟的东西只会让他更答不上来）；虚构一个篇目是最坏的情况，等于替他找材料。\n"
         "· 提篇目时**不要去问那篇里的情节或人物**（“哪个角色”“哪一段讲了什么”）——"
         "问的是它跟你眼前这个说法对不对得上。追人物情节是考据，推不动论证。\n"
         "· **不许只有安抚没有抓手**，也不许连甩好几个问题——**只能有一个问句**。\n"
@@ -458,7 +542,9 @@ def build_turn_nudge(stage, is_opening=False, last_user="", wrap_mode="", turn_n
     """
     # 他卡住了：整段换成求助结构。教材线索就是在这时才给出去的——
     # 平时不给，是为了避免变成"每问必提《劝学》"的硬拉。
-    if help_mode:
+    #     【2026-10-15】wrap_mode 非空时不许再走求助结构——已经判定该收了，
+    #     就不能回头"再给一次抓手"。
+    if help_mode and not wrap_mode:
         return build_help_nudge(last_user, next_point, textbook_hints, prev_questions)
     asked = ""
     if prev_questions:
@@ -873,17 +959,79 @@ def generate_assistant(stage, history, last_user="", essay="", round_num=1, prev
     # 1) 正文：纯文本生成（不要求模型附带标注——实测它会漏、且会污染正文风格）
     text = ""
     if ZHIPU_API_KEY:
-        try:
-            text = call_zhipu(system_prompt, api_history)
-        except Exception:
-            text = ""
+        # 生成后确定性复检：不合规就带着"上一条作废 + 为什么作废"让它重写，最多 2 次。
+        # 【2026-10-15】以前这里只生成一次，写完就发；三问过载、原地打转都靠提示词拦，
+        # 而我们用 glm-4-flash 的实测是：提示词拦不住。所以改成"生成—检查—重写"的循环。
+        for _attempt in range(3):
+            try:
+                _raw = call_zhipu(system_prompt, api_history)
+            except Exception:
+                break                      # 调用失败：用上一轮已经拿到的 text，别丢内容
+            if not _raw:
+                break
+            _clean, _leak_s, _leak_w = parse_meta(_raw)
+            _clean = clean_ai_tics(_clean, is_opening)
+            bad, note = "", ""
+            # (a) 原地打转：这一句和上一条 AI 回复太像，学生看到的就是同一个问题问两遍。
+            #     判据是文本相似度，不看断裂点——断裂点判定失败、点换来换去都能绕开配额，
+            #     但话写得像不像骗不了人。收尾回合豁免（梳理总结本来就要说几句相似的话）。
+            #     阈值卡长度用 12 字而不是 30 字：一个问题通常二十来字，
+            #     按 30 卡的时候"同上一条、只换两个词"的短问句整条漏网——
+            #     而恰恰是这种短句，学生最一眼看出来"你又问了一遍"。
+            _prev_ai = [c for r_, c in history if r_ == "assistant" and (c or "")]
+            if wrap_mode not in ("now", "after") and _prev_ai and len(_clean) > 12:
+                _ratio = difflib.SequenceMatcher(None, _prev_ai[-1][:400],
+                                                 _clean[:400]).ratio()
+                if _ratio >= REPLY_SIMILARITY_MAX:
+                    bad = "与上一轮问法重合 %.0f%%" % (_ratio * 100)
+                    note = ("【上一条回复作废】你这一轮问的和上一轮几乎是同一个问题（重合约 %.0f%%）。"
+                            "学生已经答过它了——再问一遍，他只会觉得你没在听。"
+                            "**换一个更小的切口**：换他作文里另外一句话来问、或者从另一个角度"
+                            "接着往下走，都不许把同一个问题换个说法再抛回去。"
+                            "如果他上一次确实没答上来（说不会、说不知道），这一轮就不要再把"
+                            "同一个问题还给他，先往前推一步再说。"
+                            % (_ratio * 100))
+            # (b) 三问过载：一次甩三四个问句，他会挑最好答的那个搪塞过去，追问等于白问。
+            #     收尾回合豁免（收尾要梳理 + 请他回看，本来就要问两句）。
+            if not bad and wrap_mode not in ("now", "after"):
+                _nq = count_questions(_clean)
+                if _nq >= MAX_QUESTIONS_PER_TURN:
+                    bad = "一次问了 %d 个问句" % _nq
+                    note = ("【上一条回复作废】你这一句里连着问了 %d 个问题。\n"
+                            "**一次只许问一个。** 学生看完三四个问句不知道该答哪个，"
+                            "通常就挑最好答的那个搪塞过去，追问等于没问。\n"
+                            "请重写：只留下**最要紧的那一个问题**，其余全部删掉，"
+                            "不要留「换句话说」「再问一句」这种补问，也不要把同一个意思"
+                            "换个说法再问一遍。整条回复就一问，说完就停。" % _nq)
+            # (c) 引据要有出处：这一回合出现的书名／篇名，必须要么是教材索引里的篇目，
+            #     要么是他自己作文里写的（实测：为了给抓手，它会拿一个篇名
+            #     充当"你读过的某某"，学生根本没读过，一句话也接不上）。
+            if not bad:
+                _known = allowed_book_titles(essay, prev_essay)
+                _unknown = [t for t in re.findall(r"《([^》]{1,16})》", _clean)
+                            if t not in _known]
+                if _unknown:
+                    bad = "凭空举了一本书：《%s》" % _unknown[0]
+                    note = ("【上一条回复作废】你提到的《%s》不在他学过的教材里，"
+                            "也不在他这篇作文里——**是你自己编的**。"
+                            "学生没读过这本书，你这么一提他就彻底答不上了，"
+                            "而且让他以为那是老师给的材料。\n"
+                            "请重写：**不许再出现任何书名、篇名、名人名言**，"
+                            "除非是下面两种情况之一：① 系统给你的教材线索里的那一篇；"
+                            "② 他自己作文（或他刚说的话）里写到的那一句。\n"
+                            "没有可引的，就只拿他自己已经写下的原句当抓手。"
+                            % _unknown[0])
+            text, leaked_strategy, leaked_wrap = _clean, _leak_s, _leak_w
+            if not bad:
+                break
+            api_history = api_history + [("user", note)]
     if not text:
         raw = demo_respond(stage, history, last_user, round_num, is_opening, wrap_mode)
         return parse_meta(raw)
-    # 万一模型自己附了标注（旧格式），先剥掉，确保不泄漏到学生端
-    text, leaked_strategy, leaked_wrap = parse_meta(text)
-    # 清掉开头套话（“你提到”“我想问一下”等），提示词压不住，生成后确定性替换
-    text = clean_ai_tics(text, is_opening)
+    # 重生成两次还是问一堆，就确定性截断到第一个问句——
+    # 宁可短一点，也不能把三四个问题一起甩给学生（他只会挑最好答的那个）。
+    if wrap_mode not in ("now", "after") and count_questions(text) >= MAX_QUESTIONS_PER_TURN:
+        text = trim_to_one_question(text)
     # 收尾由后端判定驱动：这一回合就是收尾回合，策略固定记「回顾看」
     if wrap_mode in ("now", "after"):
         return text, "回顾看", True
@@ -1073,8 +1221,8 @@ def chat():
     prev_essay = get_prev_essay(conv["student_id"], round_num) if stage == 1 else ""
     # 取历史
     rows = conn.execute(
-        "SELECT role, content, strategy, point FROM messages WHERE conversation_id=? ORDER BY id",
-        (conv_id,)).fetchall()
+        "SELECT role, content, strategy, point, help_type FROM messages "
+        "WHERE conversation_id=? ORDER BY id", (conv_id,)).fetchall()
     history = [(r["role"], r["content"]) for r in rows]
     # 第2轮＝升格稿对照：把该生第1轮（原稿）的完整对话也带上。
     # 仅靠开场那一次注入不够——后续每个来回若丢掉上一轮对话，AI 就不知道
@@ -1110,29 +1258,16 @@ def chat():
     wrap_mode = "after" if already_wrapped else ""
     next_point = ""
     point_repeat = 0
+    turns = len([r for r in rows if r["role"] == "user"]) + 1
     if stage == 1 and not already_wrapped:
         tail = "\n".join(
             ("AI：" if r["role"] == "assistant" else "学生：") + (r["content"] or "")[:300]
             for r in rows[-6:])
         tail += "\n学生：" + user_text[:300]
-        turns = len([r for r in rows if r["role"] == "user"]) + 1
         # 已经追过哪些断裂点（内部推进用，不参与研究编码）
         asked_points = [r["point"] for r in rows if r["point"]]
         # 一次判定办两件事：这一轮追哪个断裂点 + 是否六个点都补上了（→ 该收尾）
         next_point = judge_point(essay, tail, asked_points)
-        # 同一个断裂点最多追两轮。判定要是还想追第三轮，强制换一个没追过的点；
-        # 都追遍了就收尾。这不是“追问上限”（不是到点就收），而是不让它在同一处反复磨——
-        # 实测判定会连选同一处（学生已经举了例子，它还接着要例子），追问原地打转。
-        if next_point in ("", "元认知反思缺失"):
-            pass
-        elif asked_points.count(next_point) >= 2:
-            for p in POINT_ORDER:
-                if p == "元认知反思缺失" or p in asked_points:
-                    continue
-                next_point = p
-                break
-            else:
-                next_point = "元认知反思缺失"
         point_repeat = asked_points.count(next_point) if next_point else 0
         if next_point == "元认知反思缺失" and turns >= MIN_TURNS_BEFORE_WRAP:
             wrap_mode = "now"
@@ -1144,8 +1279,55 @@ def chat():
     # ② 只有卡住时才检索教材——平时给，他会变成"每问必提《劝学》"的硬拉。
     help_mode = (stage == 1 and wrap_mode == ""
                  and looks_like_help_request(user_text))
+    # 他在抱怨"你又问同一个"——这是最直白的抵触信号
+    complained = (stage == 1 and looks_like_repeat_complaint(user_text))
+    # ---- 【2026-10-15 统一兜底】不让它在同一处反复磨 ----
+    # 原先"同一断裂点最多追两轮"这条配额只写在正常追问那一个分支里，求助结构
+    # （help_mode）整个绕开了它，而学生答不出时恰恰最容易连续触发求助判定；
+    # 判定失败、next_point 为空时更是直接放任，模型顺着惯性把同一个问题再问一遍。
+    # 许总截图那一组：学生连说"我想不出来""怎么又问我重复的问题""我刚才说过了"，
+    # AI 在同一处追了四轮——按我们自己的判据，这组对话的数据是废的。
+    # 现在把配额提到所有分支之外统一执行，判据只看**已写进库的 point 计数**，
+    # 不依赖这一回合的判定结果，任何分支都绕不过去。
+    if stage == 1 and not already_wrapped:
+        ai_pts = [r["point"] for r in rows
+                  if r["role"] == "assistant" and r["point"]]
+        helps = [r["help_type"] for r in rows if r["role"] == "assistant"]
+        streak = 0                      # 历史末尾连续几次求助（本回合不计）
+        for h in reversed(helps):
+            if h:
+                streak += 1
+            else:
+                break
+        unused = next((p for p in POINT_ORDER
+                       if p != "元认知反思缺失" and p not in ai_pts), "")
+        # (A) 判定失败（没有 next_point）时不能放任——给它一个还没追过的点，
+        #     否则它就顺着上一轮的惯性把同一个问题换个说法再问一遍。
+        if wrap_mode != "now" and not next_point and unused:
+            next_point = unused
+        # (B) 同一个点最多追两轮，到数硬性换点；六个点都追遍了就收尾。
+        #     这不是"追问上限"（不是到点就收），而是不许在同一处磨第三遍。
+        if (wrap_mode != "now" and next_point and next_point != "元认知反思缺失"
+                and ai_pts.count(next_point) >= 2):
+            if unused:
+                next_point, point_repeat, wrap_mode = unused, 0, ""
+            else:
+                next_point = "元认知反思缺失"
+                if turns >= MIN_TURNS_BEFORE_WRAP:
+                    wrap_mode = "now"
+        # (C) 学生已经明确抱怨重复：他不会再认真答了，继续问只是消耗。
+        if wrap_mode != "now" and complained and turns >= MIN_TURNS_BEFORE_WRAP:
+            next_point, wrap_mode = "元认知反思缺失", "now"
+        # (D) 连着第三次求助（本回合 + 历史末尾两次）：再给抓手只会更抵触，该收了。
+        if wrap_mode != "now" and help_mode and streak >= 2 and turns >= MIN_TURNS_BEFORE_WRAP:
+            next_point, wrap_mode = "元认知反思缺失", "now"
+        point_repeat = ai_pts.count(next_point) if next_point else 0
     tb_hints = []
-    if help_mode:
+    # 收尾优先于求助：这一回合已经判定该收了，就不能再按求助模板"再给一个抓手"
+    # ——那正是截图里连问四轮的成因（学生说不会→给抓手→再问→"你又问"→再给抓手……）。
+    if wrap_mode:
+        help_mode = False
+    elif help_mode:
         tb_hints = pick_textbook_hints(
             " ".join([topic_head(conv_topic), (next_point or ""), user_text[:40]]),
             history, top_n=2)
@@ -1158,10 +1340,11 @@ def chat():
                                                     textbook_hints=tb_hints,
                                                     help_mode=help_mode)
     conn.execute(
-        "INSERT INTO messages(conversation_id, role, content, strategy, point, created_at) "
-        "VALUES(?,?,?,?,?,?)",
+        "INSERT INTO messages(conversation_id, role, content, strategy, point, "
+        "help_type, created_at) VALUES(?,?,?,?,?,?,?)",
         (conv_id, "assistant", text, strategy,
-         next_point or ("元认知反思缺失" if wrap_mode == "now" else None), now_str()))
+         next_point or ("元认知反思缺失" if wrap_mode == "now" else None),
+         "help" if help_mode else None, now_str()))
     conn.commit()
     conn.close()
     # 收尾状态：模型判定该收尾（末尾标注 @@收尾=是@@）、或此前已收尾

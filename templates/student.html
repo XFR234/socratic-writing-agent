@@ -132,6 +132,13 @@
       <input id="name" placeholder="请输入你的姓名">
       <label>学号（选填）</label>
       <input id="sid" placeholder="选填">
+      <!-- 题干信息：老师不统一设定的时候由学生自己抄上来。
+           没有题干，AI 只能看他写了什么，看不出他有没有扣题、把题目里的关键词读准了没有。 -->
+      <div id="topicBox">
+        <label>题干信息 *</label>
+        <textarea id="topic" style="min-height:70px" placeholder="把试卷上这道作文题抄在这里——题目、材料、写作要求，照原样抄全。"></textarea>
+        <div class="hint">就是试卷上印的那道作文题。<b>只写题目那几个字不够</b>：苏格拉底要靠材料才知道题目给了什么限制、你有没有把关键词读准。</div>
+      </div>
       <div id="essayBox">
         {% if draft_type == '升格稿' %}
         <label>粘贴你<b>修改后的升格稿</b>（<b>必填</b>）</label>
@@ -282,6 +289,13 @@ function startChat() {
   const name = document.getElementById('name').value.trim();
   if (!name) { alert('请填写姓名'); return; }
   const sid = document.getElementById('sid').value.trim();
+  const topicEl = document.getElementById('topic');
+  const topic = topicEl ? topicEl.value.trim() : '';
+  if (!topic) {
+    alert('请填写题干信息。\n把试卷上这道作文题抄上来——题目、材料、写作要求。\n'
+        + '只有题目那几个字，苏格拉底看不出题目给了什么限制。');
+    return;
+  }
   const essay = document.getElementById('essay').value.trim();
   if (essay.length < MIN_ESSAY_LEN) {
     alert('请粘贴完整的作文（不少于 ' + MIN_ESSAY_LEN + ' 字）。\n'
@@ -289,7 +303,8 @@ function startChat() {
     return;
   }
   fetch('/start', {method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'},
-    body:`name=${encodeURIComponent(name)}&sid=${encodeURIComponent(sid)}&essay=${encodeURIComponent(essay)}`})
+    body:`name=${encodeURIComponent(name)}&sid=${encodeURIComponent(sid)}`
+        + `&topic=${encodeURIComponent(topic)}&essay=${encodeURIComponent(essay)}`})
     .then(r=>r.json()).then(d=>{
       if (d.error) { alert(d.error); return; }
       document.getElementById('startBox').classList.add('hidden');

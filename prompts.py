@@ -190,11 +190,24 @@ STUDENT_RESPONSE_BLOCK = """【学生可能这样回你——你都这么接（�
 总原则：学生说什么，你都先接住、再轻轻引回思考；难度的旋钮你拿着——他卡住，你就把问题拆小、把话说明白，但答案永远让他自己给。"""
 
 
+# 本次作文题的题干（题目＋材料／写作要求），由学生抄上来。
+# 没有它，AI 只能看到学生写了什么，看不出他有没有扣题、把题目里的关键词读准了没有——
+# 而"扣不扣题"恰恰是议论文最要紧的一条。
+TOPIC_BLOCK = """
+【本次作文题的题干（学生拿到手的那道题）】
+{topic}
+这是学生要写的那道题。它是一把尺子：看他作文里的说法是扣着这道题说的，
+还是自己换了另一个话题在说；也看他有没有把题目里的关键词读准。
+追问时可以在他跑题或把关键词理解偏了的地方下手，但**不要直接告诉他题目是什么意思**。
+"""
+
+
 # ============ 阶段一系统提示词：虚拟论敌 ============
-def build_stage1_system(round_num=1, prev_essay=""):
+def build_stage1_system(round_num=1, prev_essay="", topic=""):
     """阶段一系统提示词。
     round_num=2 时另注入"对照升格稿"任务块：prev_essay 为该生第1轮提交的原稿文本，
-    让 AI 能对照原稿判断"上轮追的断裂点是否补上"，而不是把升格稿当新作文重来。"""
+    让 AI 能对照原稿判断"上轮追的断裂点是否补上"，而不是把升格稿当新作文重来。
+    topic=本次作文题的题干（题目＋材料／写作要求），有则注入，作为扣题与否的尺子。"""
     pool = ROUND_POOL.get(round_num, ROUND_POOL[1])
     # 注意：回顾看不进追问池——它是收尾动作，由提示词里的“何时收尾”规则触发
     strat_lines = []
@@ -208,7 +221,12 @@ def build_stage1_system(round_num=1, prev_essay=""):
             draft_note = "\n" + ASCEND_BLOCK.format(prev_essay=prev_essay.strip())
         else:
             draft_note = "\n" + ASCEND_NO_PREV_BLOCK
+    # 题干：有则注入，作为"扣没扣题"的尺子（学生必填项，见 /start）
+    topic_note = ""
+    if topic and topic.strip():
+        topic_note = TOPIC_BLOCK.format(topic=topic.strip())
     return f"""{PERSONA}
+{topic_note}
 
 你是陪学生练议论文的“虚拟论敌”（见开题报告）。学生发来一篇作文，你要做的，就是找出他论证里最没说清、最站不住脚的那一个点，然后直接问一个问题，帮他把这一点想明白。
 {draft_note}

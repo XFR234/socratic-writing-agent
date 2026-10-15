@@ -107,6 +107,9 @@ def init_db():
     # 追问方向记录：这一轮 AI 追的是哪个断裂点。**只用于内部推进**（让判定知道
     # 哪些点已经追过、该换点了），不作为研究编码数据——断裂点编码由研究者人工完成。
     ensure_column(conn, "messages", "point", "TEXT")
+    # 本次作文题的题干（题目＋材料／写作要求），学生必填。
+    # 没有它，AI 只看得到学生写了什么，看不出扣没扣题。
+    ensure_column(conn, "conversations", "topic", "TEXT")
     conn.commit()
     conn.close()
 
@@ -689,14 +692,16 @@ def demo_respond(stage, history, last_user, round_num=1, is_opening=False, wrap_
 
 
 def generate_assistant(stage, history, last_user="", essay="", round_num=1, prev_essay="",
-                       wrap_mode="", is_opening=False, next_point="", point_repeat=0):
+                       wrap_mode="", is_opening=False, next_point="", point_repeat=0,
+                       topic=""):
     """返回 (给学生的正文, 引导策略, 是否该收尾)。
     prev_essay：第2轮时传入该生第1轮的原稿，用于"对照升格稿再诊断"。
+    topic：本次作文题的题干，注入系统提示词，作为"扣没扣题"的尺子。
     wrap_mode："" 正常追问 / "now" 这一回合收尾 / "after" 收尾后学生又多说的。
     is_opening：是否为本轮第一次追问（开场），此时不能说"针对他刚才那句"。"""
     api_history = list(history)
     if stage == 1:
-        system_prompt = build_stage1_system(round_num, prev_essay)
+        system_prompt = build_stage1_system(round_num, prev_essay, topic)
         if essay and essay.strip():
             if round_num == 2 and prev_essay and prev_essay.strip():
                 intro = (
@@ -750,7 +755,7 @@ def generate_assistant(stage, history, last_user="", essay="", round_num=1, prev
     return text, strategy, wrap
 
 
-def ensure_round_conversation(student_id, essay=""):
+def ensure_round_conversation(student_id, essay="", topic=""):
     """确保该生在当前轮次有一个对话：有则复用，无则按规则新建（含自动开场白）。
     返回 (conv_id, essay)。本轮**必须由学生提交本轮的作文**才能新建；未提交则返回 (None, '')。"""
     round_num = get_active_round()
@@ -776,9 +781,9 @@ def ensure_round_conversation(student_id, essay=""):
     # 第2轮：先取第1轮原稿（写事务之前查，避免与未提交的写操作抢锁）
     prev_essay = get_prev_essay(student_id, round_num)
     cur = conn.execute(
-        "INSERT INTO conversations(student_id, round, stage, essay, draft_type, created_at) "
-        "VALUES(?,?,?,?,?,?)",
-        (student_id, round_num, stage, base_essay, draft_type, now_str()))
+        "INSERT INTO conversations(student_id, round, stage, essay, draft_type, topic, created_at) "
+        "VALUES(?,?,?,?,?,?,?)",
+        (student_id, round_num, stage, base_essay, draft_type, topic, now_str()))
     conv_id = cur.lastrowid
     hist_rows = conn.execute(
         "SELECT role, content FROM messages m JOIN conversations c "
@@ -789,6 +794,7 @@ def ensure_round_conversation(student_id, essay=""):
         opening, strategy, _ = generate_assistant(1, history_ctx, essay=base_essay,
                                                   round_num=round_num,
                                                   prev_essay=prev_essay,
+                                                  topic=topic,
                                                   is_opening=True)
     else:
         opening = STAGE2_OPENING
@@ -849,6 +855,9 @@ def start():
     name = (request.form.get("name") or "").strip()
     sid = (request.form.get("sid") or "").strip()
     essay = (request.form.get("essay") or "").strip()
+    # 本次作文题的题干（题目＋材料／写作要求），必填：
+    # 没有它，AI 只看得到学生写了什么，看不出扣没扣题、关键词读准了没有。
+    topic = (request.form.get("topic") or "").strip()
     if not name:
         return jsonify({"error": "请填写姓名"}), 400
     conn = get_db()
@@ -868,6 +877,11 @@ def start():
     # 本轮尚未建对话时，必须提交**本轮**的作文（不接受只写一个观点）
     round_num = get_active_round()
     if not has_round_conversation(student_id, round_num):
+        if not topic:
+            return jsonify({
+                "error": "请先填写题干信息：把试卷上这道作文题抄上来"
+                         "（题目、材料、写作要求）。只有题目那几个字，"
+                         "苏格拉底看不出题目给了什么限制。"}), 400
         if not essay:
             return jsonify({"error": "请先粘贴你本轮的作文，再开始对话"}), 400
         if len(essay) < MIN_ESSAY_LEN:
@@ -876,7 +890,7 @@ def start():
                          "AI 要读完整篇，才能找到你论证里的问题。" % MIN_ESSAY_LEN}), 400
 
     # 按轮次分对话：复用 ensure_round_conversation（与首页刷新同一条逻辑）
-    conv_id, essay = ensure_round_conversation(student_id, essay)
+    conv_id, essay = ensure_round_conversation(student_id, essay, topic)
     if conv_id is None:
         return jsonify({"error": "请先粘贴你本轮的作文，再开始对话"}), 400
 
@@ -905,11 +919,13 @@ def chat():
     conv_id = session["conv_id"]
     conn = get_db()
     conv = conn.execute(
-        "SELECT round, stage, essay, student_id FROM conversations WHERE id=?",
+        "SELECT round, stage, essay, student_id, topic FROM conversations WHERE id=?",
         (conv_id,)).fetchone()
     round_num = conv["round"]
     stage = conv["stage"]
     essay = conv["essay"] or ""
+    # 本次作文题的题干：每个来回都要带着，AI 才能一直拿它当"扣没扣题"的尺子
+    conv_topic = (conv["topic"] or "").strip()
     # 第2轮：取第1轮原稿做对照（每个来回都注入，保证全程都能对照原稿判断断裂点是否补上）
     prev_essay = get_prev_essay(conv["student_id"], round_num) if stage == 1 else ""
     # 取历史
@@ -984,7 +1000,8 @@ def chat():
     text, strategy, should_wrap = generate_assistant(stage, history, raw_user, essay,
                                                     round_num, prev_essay,
                                                     wrap_mode, next_point=next_point,
-                                                    point_repeat=point_repeat)
+                                                    point_repeat=point_repeat,
+                                                    topic=conv_topic)
     conn.execute(
         "INSERT INTO messages(conversation_id, role, content, strategy, point, created_at) "
         "VALUES(?,?,?,?,?,?)",
@@ -1131,19 +1148,20 @@ def admin_export():
         return redirect(url_for("admin_login"))
     conn = get_db()
     rows = conn.execute(
-        "SELECT s.name, s.sid, c.round, c.stage, c.draft_type, c.created_at AS conv_time, "
+        "SELECT s.name, s.sid, c.round, c.stage, c.draft_type, c.topic, "
+        "c.created_at AS conv_time, "
         "m.role, m.strategy, m.content, m.created_at "
         "FROM messages m JOIN conversations c ON m.conversation_id=c.id "
         "JOIN students s ON c.student_id=s.id ORDER BY s.id, c.id, m.id").fetchall()
     conn.close()
     output = io.StringIO()
     writer = csv.writer(output)
-    writer.writerow(["姓名", "学号", "轮次", "稿次", "阶段", "对话开始时间", "角色",
+    writer.writerow(["姓名", "学号", "轮次", "稿次", "题干", "阶段", "对话开始时间", "角色",
                      "使用/引导策略", "图尔敏断裂点", "内容", "消息时间"])
     for r in rows:
         toulmin = TOULMIN_MAP.get(r["strategy"], "") if r["strategy"] else ""
         writer.writerow([r["name"], r["sid"] or "", r["round"], r["draft_type"] or "",
-                         r["stage"], r["conv_time"],
+                         r["topic"] or "", r["stage"], r["conv_time"],
                          "学生" if r["role"] == "user" else "AI",
                          r["strategy"] or "", toulmin, r["content"], r["created_at"]])
     data = "\ufeff" + output.getvalue()

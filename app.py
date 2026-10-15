@@ -30,6 +30,8 @@ from prompts import (
     POINT_ORDER, POINT_DESC,
 )
 
+import textbook
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 # DB_PATH 可经环境变量覆盖（如需挂载持久磁盘）；默认项目内 SQLite 文件
 DB_PATH = os.environ.get("DB_PATH", os.path.join(BASE_DIR, "conversations.db"))
@@ -305,8 +307,140 @@ def collect_prev_questions(history, limit=5, width=110):
     return qs[-limit:]
 
 
+# 学生的求助信号词：他是在向 AI 要材料，而不是在作答。
+# 用子串匹配（"提示"能接住"给我点提示""给个提示""提示一下"各种说法）——
+# 实测按整句匹配，"想不出别的例子了"这种既不是"想不出来"也不是"想不到"，
+# 一条都接不住，教材线索于是一次都没给出去。
+HELP_SIGNALS = (
+    "不知", "想不出", "想不到", "说不上", "答不上", "不会", "没思路",
+    "没头绪", "举不出", "没例子", "没想法", "没头绪", "提示", "帮我",
+    "写不出", "说不出", "卡住", "不清楚", "想不起来", "没啥可说",
+)
+
+
+def looks_like_help_request(text):
+    """他这句话是在要材料，还是在作答？
+
+    09-29 这个版本没有 10-03 那套求助判定机制，而教材线索的用途恰恰是
+    "他向你要材料时，给他一个篇目让他自己去回忆"。所以这里用关键词判定，
+    不额外调一次 API——省一次调用，也不引入判定漂移（temperature 波动）。
+    """
+    t = (text or "").strip()
+    if not t or len(t) > 60:
+        # 长句多半是在正经作答（正经作答时不需要教材抓手）
+        return False
+    return any(s in t for s in HELP_SIGNALS)
+
+
+def topic_head(topic, limit=24):
+    """从题干里只取「题目」那一行。
+
+    整道题干抄进来会带进"时代""社会""人生"这类高频词，检索就成了撞运气——
+    实测靠一个"时代"命中《以工匠精神雕琢时代品质》，而那篇和兼听则明毫无关系。
+    题目那四个字才是检索该用的东西。
+    """
+    for ln in (topic or "").split("\n"):
+        s = ln.strip()
+        if s.startswith(("题目：", "题目:")):
+            return s[:limit]
+    return (topic or "").strip()[:limit]
+
+
+def pick_textbook_hints(query, history=None, top_n=2):
+    """检索教材篇目线索，并剔掉这几轮已经提过的篇目。
+
+    剔除是必要的：不剔的话它会连着两轮都提《劝学》，而学生根本没在讲学习之道——
+    "重复提同一篇"和"追问原地打转"是同一种毛病，只是换了载体。
+    """
+    try:
+        hits = textbook.search_textbook(query, top_n=top_n + 3)
+    except Exception:
+        return []
+    if not hits:
+        return []
+    used = set()
+    for role, content in (history or []):
+        if role == "assistant":
+            used.update(re.findall(r"《([^》]{1,12})》", content or ""))
+    out = []
+    for h in hits:
+        title = h.get("篇目", "")
+        if not title:
+            continue
+        # 索引里篇目带作者后缀（"劝学（荀子）"），比对时取前半
+        if title in used or title.split("（")[0] in used:
+            continue
+        out.append(h)
+        if len(out) >= top_n:
+            break
+    return out
+
+
+def build_help_nudge(last_user="", next_point="", textbook_hints=None,
+                     prev_questions=None):
+    """他卡住了、向你要材料时的就近约束（题材、措辞同 10-03 那套，分支砍掉）。
+
+    旧版没有这一环：学生说"我想不出来"，AI 只管继续追问，于是越问越抽象、
+    学生越答不出——教材索引加进来后依然用不上（2026-10-15 实测三场，
+    一次篇目都没提：写成"可选用"，它就不选）。见 build_turn_nudge 的 help_mode。
+
+    09-29 这个版本原本没有这一环：学生说"我想不出来"，AI 只管继续追问，
+    于是越问越抽象、学生越答不出——教材索引加进来后依然用不上
+    （2026-10-15 实测三场，一次篇目都没提，因为"可选用"它就不选）。
+
+    结构照 10-03 那套（给抓手 + 缩小问题），但砍掉了那里的分支：
+    这里只有一个求助形态，不再分 direct / repeat。
+
+    红线仍是那一条：**给抓手，不给答案**；抓手只能是他自己写过的东西，
+    或者教材的篇目。
+    """
+    quote = (last_user or "").strip()
+    if len(quote) > 120:
+        quote = quote[:120] + "……"
+    # 已经问过的问题逐条摊开：光说"不许重复"压不住它换句式重问
+    asked = ""
+    if prev_questions:
+        asked = ("【你已经问过他下面这几个问题——这一轮**必须换一个**，"
+                 "换个说法再问一遍也算重复】\n"
+                 + "\n".join("· " + q for q in prev_questions) + "\n")
+    tb = ""
+    if textbook_hints:
+        tb = "\n" + textbook.format_textbook_hints(textbook_hints, strong=True) + "\n"
+    focus = ""
+    if next_point and next_point in POINT_DESC:
+        focus = "（这一轮仍追同一个点——" + next_point + "，但难度要降下来。）\n"
+    return (
+        "（以上是你和他的对话。他刚才说的是：“" + quote + "”\n"
+        "**他这一句不是在作答，是在向你要材料**——他卡住了，说不下去了。\n"
+        + focus + asked + tb +
+        "按这个顺序说三件事：\n"
+        "1. **一句安抚**（只一句）：承认这一问确实难，卡在这儿很正常。"
+        "不许说“你已经很好了”“你很有潜力”这种空话。\n"
+        "2. **给一个具体抓手**：\n"
+        "　　① 上面给了教材线索时，**就提那一篇**——只提篇目，让他自己去回忆。"
+        "（给了线索又不提，教材索引就成了摆设：实测它每次都挑更容易的作文原句。）\n"
+        "　　② 没给教材线索时，才退回他作文里（或他刚说过的）已经写下的那一句，"
+        "让他看出答案其实就在他自己写的东西里。\n"
+        "3. **把问题缩到他答得上来**：不要再问“这个概念是什么意思”这种大问题，"
+        "要问一个具体的、能一口答上来的小问题（比如让他从自己写过的那句话里"
+        "挑出两三项、先说其中最明显的一项）。\n"
+        + tb +
+        "【红线——违反就等于替他写】\n"
+        "· **不许把答案说出来**：不许定义概念、不许写开头或段落、不许举例证、"
+        "不许讲课文内容或名句。\n"
+        "· 提篇目时**不要去问那篇里的情节或人物**（“哪个角色”“哪一段讲了什么”）——"
+        "问的是它跟你眼前这个说法对不对得上。追人物情节是考据，推不动论证。\n"
+        "· **不许只有安抚没有抓手**，也不许连甩好几个问题——**只能有一个问句**。\n"
+        "· 不要用“你提到”“我想了解一下”这类套话开场。\n"
+        "· 这一回合**不要**收尾，也**不要**换成另一个断裂点。\n"
+        "**最后必须以一个问句收尾。**\n"
+        "回复说完就完了，不要附任何标注、括号说明、JSON 或记号。）"
+    )
+
+
 def build_turn_nudge(stage, is_opening=False, last_user="", wrap_mode="", turn_no=1,
-                     prev_questions=None, next_point="", point_repeat=0):
+                     prev_questions=None, next_point="", point_repeat=0,
+                     textbook_hints=None, help_mode=False):
     """追加在每回合对话末尾的即时指令（「就近约束」）。
 
     为什么放在末尾而不是系统提示词里：系统提示词很长，模型对其中“怎么问”的约束
@@ -322,6 +456,10 @@ def build_turn_nudge(stage, is_opening=False, last_user="", wrap_mode="", turn_n
     · prev_questions 逐条列出已问过的问题。另一个高频毛病是**用“是否……？”“是不是……”
       这种只要学生答“是／否”的问句**，追问推不动，必须一并禁掉。
     """
+    # 他卡住了：整段换成求助结构。教材线索就是在这时才给出去的——
+    # 平时不给，是为了避免变成"每问必提《劝学》"的硬拉。
+    if help_mode:
+        return build_help_nudge(last_user, next_point, textbook_hints, prev_questions)
     asked = ""
     if prev_questions:
         asked = ("你已经问过他下面这几轮问题，**这一回合绝对不要重复它们**——"
@@ -384,7 +522,11 @@ def build_turn_nudge(stage, is_opening=False, last_user="", wrap_mode="", turn_n
             "回复说完就完了，不要附任何标注、括号说明、JSON 或记号。）")
     opener_line = ("现在就按上面指明的那个断裂点，针对他这一句里最没说清的地方追问：\n"
                    if focus else "现在只针对他这一句里最没说清的一处继续追问：\n")
-    return head + asked + focus + opener_line + (
+    # 教材线索：只在他求助（要材料）时才给，且只给篇目——见 pick_textbook_hints
+    tb = ""
+    if textbook_hints:
+        tb = "\n" + textbook.format_textbook_hints(textbook_hints) + "\n"
+    return head + asked + focus + tb + opener_line + (
         "1. **追问的方向必须始终朝着他的论证本身**——他那句话立不立得住、那个例子撑不撑得住"
         "观点、有没有反例、有没有例外。**不要滑到对他举的例子做细节考据**"
         "（比如那个例子里的人当时心里怎么想、依据了哪条原则、有没有别的动机）——"
@@ -693,7 +835,7 @@ def demo_respond(stage, history, last_user, round_num=1, is_opening=False, wrap_
 
 def generate_assistant(stage, history, last_user="", essay="", round_num=1, prev_essay="",
                        wrap_mode="", is_opening=False, next_point="", point_repeat=0,
-                       topic=""):
+                       topic="", textbook_hints=None, help_mode=False):
     """返回 (给学生的正文, 引导策略, 是否该收尾)。
     prev_essay：第2轮时传入该生第1轮的原稿，用于"对照升格稿再诊断"。
     topic：本次作文题的题干，注入系统提示词，作为"扣没扣题"的尺子。
@@ -726,7 +868,8 @@ def generate_assistant(stage, history, last_user="", essay="", round_num=1, prev
     # 并把前面已问过的问题逐条摊给它看（防止换句式重问同一个点）
     api_history = api_history + [("user", build_turn_nudge(
         stage, is_opening, last_user, wrap_mode, turn_no,
-        collect_prev_questions(history), next_point, point_repeat))]
+        collect_prev_questions(history), next_point, point_repeat,
+        textbook_hints, help_mode))]
     # 1) 正文：纯文本生成（不要求模型附带标注——实测它会漏、且会污染正文风格）
     text = ""
     if ZHIPU_API_KEY:
@@ -996,12 +1139,24 @@ def chat():
         elif not next_point and judge_wrap(tail, turns):
             # 追问方向判定失败时才回落用收尾判定兜底，省一次调用
             wrap_mode = "now"
+    # 他这一句是在向你要材料（卡住了），还是在做答？两条后果：
+    # ① 卡住了就走求助结构（给抓手 + 缩小问题），不再只管追问；
+    # ② 只有卡住时才检索教材——平时给，他会变成"每问必提《劝学》"的硬拉。
+    help_mode = (stage == 1 and wrap_mode == ""
+                 and looks_like_help_request(user_text))
+    tb_hints = []
+    if help_mode:
+        tb_hints = pick_textbook_hints(
+            " ".join([topic_head(conv_topic), (next_point or ""), user_text[:40]]),
+            history, top_n=2)
     # 生成 AI 回复
     text, strategy, should_wrap = generate_assistant(stage, history, raw_user, essay,
                                                     round_num, prev_essay,
                                                     wrap_mode, next_point=next_point,
                                                     point_repeat=point_repeat,
-                                                    topic=conv_topic)
+                                                    topic=conv_topic,
+                                                    textbook_hints=tb_hints,
+                                                    help_mode=help_mode)
     conn.execute(
         "INSERT INTO messages(conversation_id, role, content, strategy, point, created_at) "
         "VALUES(?,?,?,?,?,?)",

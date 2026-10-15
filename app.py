@@ -29,6 +29,7 @@ from prompts import (
     STAGE2_OPENING, build_stage1_opening, build_stage2_user_prefix,
     build_stage1_system, ROUND_STAGE, TOULMIN_MAP, DRAFT_TYPE_BY_ROUND,
     POINT_ORDER, POINT_DESC, POINT_STRATEGY, build_strategy_card, STAGE1_ASK,
+    POINT_GROUPS,
 )
 
 import textbook
@@ -118,6 +119,8 @@ def init_db():
     # 学生一直说"我不会"——截图里那组就是这么连问了四轮。
     # 只靠当回合判定算不出"连着几次"，得看历史，所以要持久化。
     ensure_column(conn, "messages", "help_type", "TEXT")
+    # 组次：同一轮次里第几组追问（收尾后学生再来 → 另开一组，沿新的断裂点继续）。
+    ensure_column(conn, "conversations", "group_no", "INTEGER")
     conn.commit()
     conn.close()
 
@@ -413,6 +416,68 @@ def trim_to_one_question(text):
     return kept if len(kept) >= 8 else text
 
 
+# 同一轮次最多开几组追问。一组 = 一次完整的"追到点上 → 收尾"。
+# 为什么要上限：只要学生在上一组收尾后再来，就会开新的一组；没有上限的话
+# 他每来一次就多一组，正式收数据时后台会堆一堆只有开场白的空组。
+MAX_GROUPS_PER_ROUND = 2
+
+
+def count_round_conversations(student_id, round_num):
+    """该生本轮已经开了几组对话。"""
+    conn = get_db()
+    row = conn.execute(
+        "SELECT COUNT(*) c FROM conversations WHERE student_id=? AND round=?",
+        (student_id, round_num)).fetchone()
+    conn.close()
+    return int(row["c"]) if row else 0
+
+
+def round_points_asked(student_id, round_num):
+    """该生本轮**所有组**已经追过哪些断裂点——跨组汇总。
+
+    为什么必须跨组：原来只统计当前这条对话，于是每开一组计数归零，
+    AI 又从头追一遍上一组已经追过、学生也答明白了的那个点，
+    学生看到的就是"怎么又问我重复的问题"。
+    """
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT m.point FROM messages m JOIN conversations c "
+        "ON c.id=m.conversation_id WHERE c.student_id=? AND c.round=? "
+        "AND m.role='assistant' AND m.point IS NOT NULL AND m.point<>'' "
+    , (student_id, round_num)).fetchall()
+    conn.close()
+    return [r["point"] for r in rows]
+
+
+def round_conversation_wrapped(conv_id):
+    """这一组是否已经收尾（出现过「回顾看」的 AI 消息）。"""
+    conn = get_db()
+    row = conn.execute(
+        "SELECT 1 FROM messages WHERE conversation_id=? AND role='assistant' "
+        "AND strategy='回顾看' LIMIT 1", (conv_id,)).fetchone()
+    conn.close()
+    return bool(row)
+
+
+def round_fully_covered(student_id, round_num):
+    """六个断裂点里，非收尾的那五个是不是都追过了。追遍了就不再开新组。"""
+    asked = set(round_points_asked(student_id, round_num))
+    return all(p in asked for p in POINT_ORDER if p != "元认知反思缺失")
+
+
+def round_prev_history(student_id, round_num, exclude_conv_id, limit=6):
+    """取该生本轮**更早那几组**的最后若干条对话，用于开场诊断。"""
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT m.role, m.content FROM messages m JOIN conversations c "
+        "ON c.id=m.conversation_id WHERE c.student_id=? AND c.round=? "
+        "AND c.id<>? ORDER BY m.id DESC LIMIT ?",
+        (student_id, round_num, exclude_conv_id, limit)).fetchall()
+    conn.close()
+    return "\n".join(("AI：" if r["role"] == "assistant" else "学生：")
+                     + (r["content"] or "")[:200] for r in reversed(rows))
+
+
 def topic_head(topic, limit=24):
     """从题干里只取「题目」那一行。
 
@@ -555,8 +620,7 @@ def build_turn_nudge(stage, is_opening=False, last_user="", wrap_mode="", turn_n
     focus = ""
     if next_point and next_point in POINT_DESC:
         focus = ("**这一轮只盯住这一个断裂点——" + next_point + "**："
-                 + POINT_DESC[next_point] + "\n"
-                 + build_strategy_card(next_point))
+                 + POINT_DESC[next_point] + "\n")
         if point_repeat:
             # 第二次追同一个点：光说“换个角度”它做不到，得把“不许怎么问”点明
             focus += ("这个点你上一轮已经问过一次了（问句见上），他没答到你要的层次。"
@@ -586,8 +650,8 @@ def build_turn_nudge(stage, is_opening=False, last_user="", wrap_mode="", turn_n
             "3. 这个问题必须逼他解释（具体指什么／为什么／凭什么／这中间差哪一步），"
             "不要问“是否……”“是不是……”这类答“是／否”就能应付过去的问题，"
             "也不要问“是 A 还是 B”这种让他二选一的问题。\n"
-            "4. 回复说完就完了，不要附任何标注、括号说明、JSON 或记号。）"
-        )
+            "4. 回复说完就完了，不要附任何标注、括号说明、JSON 或记号。）\n"
+            + build_strategy_card(next_point, strict=True))
     quote = (last_user or "").strip()
     if len(quote) > 160:
         quote = quote[:160] + "……"
@@ -795,17 +859,27 @@ JUDGE_POINT_TEMPLATE = """这是一篇高中议论文，和围绕它已经发生
 {dialogue}
 
 {asked}
-六个断裂点（next 只能从这六个词里选一个原样填）：
-- 主张模糊：他核心的那句话本身就含糊，关键词含义不清、主张范围不明；
-- 担保断裂：他摆了例子或名言，但说不上这些材料凭什么能支持他的观点；
-- 支撑薄弱：他的理由背后缺少更根本的依据，或者只孤零零举了一个例子；
-- 限定缺失：他把话说得太满，没交代什么条件下成立、什么情况下不成立；
-- 反驳缺席：他从没想过有人会反对，也没交代反方会怎么说；
-- 元认知反思缺失：上面几处他都已经用自己的话说清楚了（哪怕不够严谨），该收尾让他回看了。
+六个断裂点按先后分成两截（next 只能从这六个词里选一个原样填）：
 
-**优先顺序**：研究报告认定高中议论文最常断的是**担保断裂**（举了例子却没说它凭什么能支撑
-观点）和**反驳缺席**（从没想过有人会反对）。作文里确实存在这两处时，优先在它们之间选，
-再考虑其余四个点。
+【第一截 · 主张层面】——这个观点本身有没有探讨空间：
+- 主张模糊：他核心的那句话本身就含糊，关键词含义不清、主张范围不明；
+- 限定缺失：他把话说得太满，没交代什么条件下成立、什么情况下不成立；
+- 反驳缺席：他从没想过有人会反对，也没交代反方会怎么说。
+
+【第二截 · 支撑层面】——他后面那段够不够证明这个观点：
+- 担保断裂：他摆了例子或名言，但**材料到主张之间那一步推理没搭**
+  ——说不清这个例子凭什么能说明这个观点（桥断了）；
+- 支撑薄弱：桥搭上了，可**依据本身太单薄**
+  ——只孤零零一个例子、材料太旧太片面、缺少更根本的依据（货太少）。
+
+【收尾】
+- 元认知反思缺失：上面两截他都已经用自己的话说清楚了（哪怕不够严谨），该收尾让他回看了。
+
+**先判第一截，再判第二截**：
+· 只要他的核心说法还含糊、说得太满、或者压根没考虑反方，next 就选第一截里的那个点
+  ——观点本身还没立清楚，这时候去追证据没有意义；
+· 第一截都站得住了，next 才从第二截里选；
+· 两截都补上了，next 填“元认知反思缺失”。
 
 请判断两点：
 1. covered —— 学生**已经在回答里用自己的话说清楚**的断裂点（他给出了解释、让步或反例就算，哪怕不完美；只是重申观点、只是给词下定义、只是又举一个例子，不算）。
@@ -871,7 +945,7 @@ def judge_wrap(dialogue_tail, turns):
     return str(w).strip().lower() in ("true", "是", "yes")
 
 
-def judge_point(essay, dialogue, asked_points=None):
+def judge_point(essay, dialogue, asked_points=None, only_points=None):
     """判定这一轮该追哪个断裂点。返回 POINT_ORDER 里的一个词，失败返回 ""。
 
     asked_points：前面几轮已经追过的断裂点。必须告诉它，否则它会在同一个点上
@@ -881,6 +955,12 @@ def judge_point(essay, dialogue, asked_points=None):
     if not ZHIPU_API_KEY or not dialogue:
         return ""
     asked = "、".join([p for p in (asked_points or []) if p])
+    if only_points:
+        allowed = [p for p in only_points if p in POINT_DESC]
+        asked = (("[前面几轮已经追过的断裂点]" + asked + "\n") if asked else "")
+        asked += ("**这一组只许从下面这几个里挑一个**：" + "/".join(allowed) + "。\n"
+                 "其余的断裂点**这一组一概不碰** -- 那是别组的事。"
+                 "这几个点都补上了的话，next 就直接填「元认知反思缺失」。\n")
     prompt = JUDGE_POINT_TEMPLATE.format(
         essay=(essay or "")[:1200],
         asked=("【前面几轮已经追过的断裂点】" + asked + "\n"
@@ -1100,20 +1180,37 @@ def generate_assistant(stage, history, last_user="", essay="", round_num=1, prev
 
 
 def ensure_round_conversation(student_id, essay="", topic=""):
-    """确保该生在当前轮次有一个对话：有则复用，无则按规则新建（含自动开场白）。
-    返回 (conv_id, essay)。本轮**必须由学生提交本轮的作文**才能新建；未提交则返回 (None, '')。"""
+    """确保该生在当前轮次有**一组正在进行**的对话。返回 (conv_id, essay)。
+
+    规则：
+    · 本轮还没有对话 → 必须提交本轮作文才能新建；
+    · 最新一组还没收尾 → 接着聊（沿用本组已存的作文/题干，不用重复粘）；
+    · 最新一组已收尾 → **另开下一组**（同一篇作文，沿还没追过的断裂点继续深挖），
+      直到六个点追遍、或达到 MAX_GROUPS_PER_ROUND。
+      之前没有这一条，所以"聊过一次再登录"就永远停在"本组已结束"，不再追问——
+      学生等于只有一次被追问的机会，后面几轮支架等于空转。
+    """
     round_num = get_active_round()
     stage = ROUND_STAGE.get(round_num, 1)
     conn = get_db()
     conv = conn.execute(
-        "SELECT id, essay FROM conversations WHERE student_id=? AND round=? "
-        "ORDER BY created_at DESC LIMIT 1",
+        "SELECT id, essay, topic FROM conversations WHERE student_id=? AND round=? "
+    "ORDER BY created_at DESC, id DESC LIMIT 1",
         (student_id, round_num)).fetchone()
     if conv:
         if not essay and conv["essay"]:
             essay = conv["essay"]
-        conn.close()
-        return conv["id"], essay
+        if not topic and conv["topic"]:
+            topic = conv["topic"] or ""
+        # 这组还没收尾 → 接着聊
+        if not round_conversation_wrapped(conv["id"]):
+            conn.close()
+            return conv["id"], essay
+        # 已收尾：六个点都追遍了、或已到组上限 → 停在最后这组，不再开新的
+        if round_fully_covered(student_id, round_num) \
+                or count_round_conversations(student_id, round_num) >= MAX_GROUPS_PER_ROUND:
+            conn.close()
+            return conv["id"], essay
     # 当前轮次尚无对话：必须由学生提交本轮的作文才能新建。
     # 不再复用上一轮的旧稿——否则学生会拿前测作文重开第2轮，AI 只能问出一模一样的问题。
     if not essay:
@@ -1124,10 +1221,12 @@ def ensure_round_conversation(student_id, essay="", topic=""):
     draft_type = DRAFT_TYPE_BY_ROUND.get(round_num, "")
     # 第2轮：先取第1轮原稿（写事务之前查，避免与未提交的写操作抢锁）
     prev_essay = get_prev_essay(student_id, round_num)
+    # 组次 = 本轮已有组数 + 1（老库没有这一列时按 1 处理）
+    group_no = count_round_conversations(student_id, round_num) + 1
     cur = conn.execute(
-        "INSERT INTO conversations(student_id, round, stage, essay, draft_type, topic, created_at) "
-        "VALUES(?,?,?,?,?,?,?)",
-        (student_id, round_num, stage, base_essay, draft_type, topic, now_str()))
+        "INSERT INTO conversations(student_id, round, stage, essay, draft_type, topic, "
+        "group_no, created_at) VALUES(?,?,?,?,?,?,?,?)",
+        (student_id, round_num, stage, base_essay, draft_type, topic, group_no, now_str()))
     conv_id = cur.lastrowid
     # 【2026-10-15】开场白的历史上下文只取**本轮次及更早**的对话，并排除本条。
     # 原来只按 student_id 取，于是同一轮换题重开留下的旧对话、后续各轮的消息
@@ -1141,11 +1240,20 @@ def ensure_round_conversation(student_id, essay="", topic=""):
         (student_id, round_num, conv_id)).fetchall()
     history_ctx = [(r["role"], r["content"]) for r in hist_rows]
     if stage == 1:
-        opening, strategy, _ = generate_assistant(1, history_ctx, essay=base_essay,
-                                                  round_num=round_num,
-                                                  prev_essay=prev_essay,
-                                                  topic=topic,
-                                                  is_opening=True)
+        # 【2026-10-15】开场先诊断这一组该从哪个断裂点切入，并把卡片绑上去。
+        # 以前开场没有任何策略指向，于是每组的第一个问题永远是它最顺手的那一种。
+        _asked = round_points_asked(student_id, round_num)
+        _tail = "\n".join(
+            ("AI：" if r == "assistant" else "学生：") + (c or "")[:200]
+            for r, c in history_ctx[-6:])
+        _nxt = judge_point(base_essay, _tail, _asked) if _tail.strip() else ""
+        if _nxt in ("", "元认知反思缺失"):
+            _nxt = ""
+        opening, strategy, _ = generate_assistant(
+            1, history_ctx, essay=base_essay,
+            round_num=round_num, prev_essay=prev_essay,
+            topic=topic, is_opening=True, next_point=_nxt,
+            point_repeat=_asked.count(_nxt) if _nxt else 0)
     else:
         opening = STAGE2_OPENING
         strategy = "回顾看"
@@ -1318,15 +1426,31 @@ def chat():
     next_point = ""
     point_repeat = 0
     turns = len([r for r in rows if r["role"] == "user"]) + 1
+    # 本组是这一轮的第几组 → 决定这一组只追哪一截断裂点
+    group_no = 1
+    try:
+        group_no = int(conv["group_no"] or 1)
+    except (IndexError, KeyError, TypeError, ValueError):
+        group_no = 1
+    only_points = POINT_GROUPS.get(group_no) or list(POINT_ORDER)
     if stage == 1 and not already_wrapped:
         tail = "\n".join(
             ("AI：" if r["role"] == "assistant" else "学生：") + (r["content"] or "")[:300]
             for r in rows[-6:])
         tail += "\n学生：" + user_text[:300]
-        # 已经追过哪些断裂点（内部推进用，不参与研究编码）
-        asked_points = [r["point"] for r in rows if r["point"]]
+        # 本组才刚开头时，把更早那几组的对话也接上——否则判定只看得到一句开场白，
+        # 诊断不出"上一组已经追过、学生已经答明白的点"，又会绕回去重问。
+        if len([r for r in rows if r["role"] == "assistant"]) < 2:
+            _earlier = round_prev_history(conv["student_id"], round_num, conv_id)
+            if _earlier:
+                tail = ("【更早那几组（已结束）】\n" + _earlier
+                        + "\n【本组开始】\n" + tail)
+        # 已经追过哪些断裂点——**跨组汇总**（内部推进用，不参与研究编码）。
+        # 只统计当前这一组的话，每开一组计数就归零，AI 会回头再追一遍
+        # 上一组已经追过的点，学生看到的就是"又问一遍"。
+        asked_points = round_points_asked(conv["student_id"], round_num)
         # 一次判定办两件事：这一轮追哪个断裂点 + 是否六个点都补上了（→ 该收尾）
-        next_point = judge_point(essay, tail, asked_points)
+        next_point = judge_point(essay, tail, asked_points, only_points=only_points)
         point_repeat = asked_points.count(next_point) if next_point else 0
         if next_point == "元认知反思缺失" and turns >= MIN_TURNS_BEFORE_WRAP:
             wrap_mode = "now"
@@ -1349,8 +1473,7 @@ def chat():
     # 现在把配额提到所有分支之外统一执行，判据只看**已写进库的 point 计数**，
     # 不依赖这一回合的判定结果，任何分支都绕不过去。
     if stage == 1 and not already_wrapped:
-        ai_pts = [r["point"] for r in rows
-                  if r["role"] == "assistant" and r["point"]]
+        ai_pts = round_points_asked(conv["student_id"], round_num)
         helps = [r["help_type"] for r in rows if r["role"] == "assistant"]
         streak = 0                      # 历史末尾连续几次求助（本回合不计）
         for h in reversed(helps):
@@ -1358,8 +1481,9 @@ def chat():
                 streak += 1
             else:
                 break
-        unused = next((p for p in POINT_ORDER
-                       if p != "元认知反思缺失" and p not in ai_pts), "")
+        # 换点只在本组这一截里换：第1组只追主张层面，第2组只追支撑层面
+        pool = [p for p in (only_points or POINT_ORDER) if p != "元认知反思缺失"]
+        unused = next((p for p in pool if p not in ai_pts), "")
         # (A) 判定失败（没有 next_point）时不能放任——给它一个还没追过的点，
         #     否则它就顺着上一轮的惯性把同一个问题换个说法再问一遍。
         if wrap_mode != "now" and not next_point and unused:

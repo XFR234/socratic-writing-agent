@@ -952,15 +952,29 @@ def judge_point(essay, dialogue, asked_points=None, only_points=None):
     反复选（实测：学生答完“限定缺失”，它还接着选“限定缺失”，追问原地绕）。
     返回“元认知反思缺失”时，同时意味着该收尾（见 /chat 里的处理）。
     """
-    if not ZHIPU_API_KEY or not dialogue:
+    # 新组开场时 tail 为空，此时只凭作文也能定切入点——以前这里直接返回空，
+    # 于是每组第一个问题都没有卡片约束，模型又回到它最顺手的那一种问法。
+    if not ZHIPU_API_KEY or not (dialogue or essay):
         return ""
     asked = "、".join([p for p in (asked_points or []) if p])
     if only_points:
         allowed = [p for p in only_points if p in POINT_DESC]
-        asked = (("[前面几轮已经追过的断裂点]" + asked + "\n") if asked else "")
+        # 已追过的列表必须**只列本截的**：原来把别组追过的点也一并摊给它看，
+        # 它一数"已经追过四个了"，再配上"都补上就填元认知"这句，
+        # 就直接判收尾——新组第一回合就收摊，这一截一个点都没问（实测第2组只跑2回合）。
+        _done = [p for p in allowed if p in (asked_points or [])]
+        _todo = [p for p in allowed if p not in (asked_points or [])]
+        asked = (("【本组这几个点里，已经追过的】" + "、".join(_done) + "\n")
+                 if _done else "")
         asked += ("**这一组只许从下面这几个里挑一个**：" + "/".join(allowed) + "。\n"
-                 "其余的断裂点**这一组一概不碰** -- 那是别组的事。"
-                 "这几个点都补上了的话，next 就直接填「元认知反思缺失」。\n")
+                 "其余的断裂点**这一组一概不碰** -- 那是别组的事。\n")
+        if _todo:
+            asked += ("**下面这几个本组一次都还没追过**：" + "、".join(_todo)
+                      + "。next 必须从这几个里挑，**不许填「元认知反思缺失」**"
+                      " -- 本组还没问过，谈不上收尾。\n")
+        else:
+            asked += ("这几个点本组都追过了；只有他在刚才的回答里确实说清楚了，"
+                      "next 才填「元认知反思缺失」。\n")
     prompt = JUDGE_POINT_TEMPLATE.format(
         essay=(essay or "")[:1200],
         asked=("【前面几轮已经追过的断裂点】" + asked + "\n"
@@ -977,7 +991,17 @@ def judge_point(essay, dialogue, asked_points=None, only_points=None):
     if not obj:
         return ""
     nxt = str(obj.get("next") or "").strip()
-    for p in POINT_ORDER:
+    # 硬校验：只认允许范围里的点。提示词里写"这一组只许从这几个里挑"拦不住它
+    # ——实测第 1 组照样回了个「支撑薄弱」，于是主张层面那组跨到了支撑层面，
+    # 按截分组等于没生效。所以后端必须再拦一道：不在候选里的一律不认，
+    # 返回空后由 /chat 的兜底配额给一个还没追过的点。
+    # 收尾信号「元认知反思缺失」任何一组都要能回，不受本截限制。
+    if only_points:
+        _ok = set(only_points) | {"元认知反思缺失"}
+        cands = [p for p in POINT_ORDER if p in _ok]
+    else:
+        cands = list(POINT_ORDER)
+    for p in cands:
         if p in nxt:
             return p
     return ""
@@ -1158,8 +1182,19 @@ def generate_assistant(stage, history, last_user="", essay="", round_num=1, prev
     # 收尾由后端判定驱动：这一回合就是收尾回合，策略固定记「回顾看」
     if wrap_mode in ("now", "after"):
         return text, "回顾看", True
-    # 研究字段：独立判定本回合的引导策略与是否收尾
-    strategy, judged_wrap = judge_turn(last_user, text)
+    # 研究字段：策略**由断裂点决定**，不再让模型事后猜。
+    # 以前这里让 judge_turn 读完 AI 的话再判"这像哪张卡"——可它看不见我们
+    # 指定的断裂点，只凭印象贴标签：实测把绑给「担保断裂」的「环顾式」判成了
+    # 「对立面」「退一步」，于是后台策略列里环顾式长期 0 次，
+    # 看上去像"环顾式用不上"，其实是**日志贴错了标签**。
+    # 现在：就近约束里指定了哪张卡，日志就记哪张卡
+    # （研究者拿到的是"支架指派值"，正好也是自变量，口径更硬）。
+    # 附带好处：省掉每回合一次判定调用，延迟从 3 次调用降到 2 次。
+    _assigned = POINT_STRATEGY.get(next_point or "", "")
+    if _assigned:
+        strategy, judged_wrap = _assigned, False
+    else:
+        strategy, judged_wrap = judge_turn(last_user, text)
     if not strategy and leaked_strategy:
         strategy = leaked_strategy
     wrap = bool(judged_wrap or leaked_wrap)
@@ -1246,7 +1281,8 @@ def ensure_round_conversation(student_id, essay="", topic=""):
         _tail = "\n".join(
             ("AI：" if r == "assistant" else "学生：") + (c or "")[:200]
             for r, c in history_ctx[-6:])
-        _nxt = judge_point(base_essay, _tail, _asked) if _tail.strip() else ""
+        _grp_pts = POINT_GROUPS.get(group_no) or list(POINT_ORDER)
+        _nxt = judge_point(base_essay, _tail, _asked, only_points=_grp_pts)
         if _nxt in ("", "元认知反思缺失"):
             _nxt = ""
         opening, strategy, _ = generate_assistant(
@@ -1377,7 +1413,11 @@ def chat():
     conv_id = session["conv_id"]
     conn = get_db()
     conv = conn.execute(
-        "SELECT round, stage, essay, student_id, topic FROM conversations WHERE id=?",
+        # group_no 必须一起取出来：少了它，下面 conv["group_no"] 会抛 KeyError，
+        # 被兜底成 1 —— 于是**每一组都被当成第 1 组**，第 2 组照旧只追主张层面，
+        # 支撑层面那一截永远走不到（实测第 2 组两回合就收尾）。
+        "SELECT round, stage, essay, student_id, topic, group_no "
+        "FROM conversations WHERE id=?",
         (conv_id,)).fetchone()
     round_num = conv["round"]
     stage = conv["stage"]
@@ -1451,11 +1491,21 @@ def chat():
         asked_points = round_points_asked(conv["student_id"], round_num)
         # 一次判定办两件事：这一轮追哪个断裂点 + 是否六个点都补上了（→ 该收尾）
         next_point = judge_point(essay, tail, asked_points, only_points=only_points)
+        # 【2026-10-15】判定落空（返回空、或被后端硬校验挡下）时**先换点，再谈收尾**。
+        # 上一版这里直接回落到 judge_wrap，而 judge_wrap 看得到"更早那几组"的完整
+        # 对话，一瞧聊了那么久就判"该收了" —— 于是新组第一回合就收尾，
+        # 支撑层面那一截一个点都没问就被判追遍了。
+        if not next_point or next_point == "元认知反思缺失":
+            _pool = [p for p in (only_points or POINT_ORDER) if p != "元认知反思缺失"]
+            _left = [p for p in _pool if asked_points.count(p) < 2]
+            if _left:
+                _left.sort(key=lambda p: asked_points.count(p))
+                next_point, wrap_mode = _left[0], ""
         point_repeat = asked_points.count(next_point) if next_point else 0
         if next_point == "元认知反思缺失" and turns >= MIN_TURNS_BEFORE_WRAP:
             wrap_mode = "now"
-        elif not next_point and judge_wrap(tail, turns):
-            # 追问方向判定失败时才回落用收尾判定兜底，省一次调用
+        elif not next_point and turns >= MIN_TURNS_BEFORE_WRAP and judge_wrap(tail, turns):
+            # 追问方向判定失败、且本截确实没有可换的点了，才回落用收尾判定兜底
             wrap_mode = "now"
     # 他这一句是在向你要材料（卡住了），还是在做答？两条后果：
     # ① 卡住了就走求助结构（给抓手 + 缩小问题），不再只管追问；

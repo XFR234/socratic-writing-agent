@@ -28,7 +28,7 @@ from prompts import (
     STRATEGY_INFO, STRATEGY_ORDER, STAGE2_SYSTEM, STAGE1_OPENING_NO_ESSAY,
     STAGE2_OPENING, build_stage1_opening, build_stage2_user_prefix,
     build_stage1_system, ROUND_STAGE, TOULMIN_MAP, DRAFT_TYPE_BY_ROUND,
-    POINT_ORDER, POINT_DESC,
+    POINT_ORDER, POINT_DESC, POINT_STRATEGY, build_strategy_card, STAGE1_ASK,
 )
 
 import textbook
@@ -489,7 +489,8 @@ def build_help_nudge(last_user="", next_point="", textbook_hints=None,
         tb = "\n" + textbook.format_textbook_hints(textbook_hints, strong=True) + "\n"
     focus = ""
     if next_point and next_point in POINT_DESC:
-        focus = "（这一轮仍追同一个点——" + next_point + "，但难度要降下来。）\n"
+        focus = ("（这一轮仍追同一个点——" + next_point + "，"
+                 + build_strategy_card(next_point) + "难度要降下来。）\n")
     return (
         "（以上是你和他的对话。他刚才说的是：“" + quote + "”\n"
         "**他这一句不是在作答，是在向你要材料**——他卡住了，说不下去了。\n"
@@ -554,7 +555,8 @@ def build_turn_nudge(stage, is_opening=False, last_user="", wrap_mode="", turn_n
     focus = ""
     if next_point and next_point in POINT_DESC:
         focus = ("**这一轮只盯住这一个断裂点——" + next_point + "**："
-                 + POINT_DESC[next_point] + "\n")
+                 + POINT_DESC[next_point] + "\n"
+                 + build_strategy_card(next_point))
         if point_repeat:
             # 第二次追同一个点：光说“换个角度”它做不到，得把“不许怎么问”点明
             focus += ("这个点你上一轮已经问过一次了（问句见上），他没答到你要的层次。"
@@ -612,6 +614,9 @@ def build_turn_nudge(stage, is_opening=False, last_user="", wrap_mode="", turn_n
     tb = ""
     if textbook_hints:
         tb = "\n" + textbook.format_textbook_hints(textbook_hints) + "\n"
+    # 【2026-10-15】卡片约束放在整条 nudge 的**最后**——离生成位置最近，权重最高。
+    # 放在前面时模型会忽略它，回到它最顺手的问法（实测五张卡长期只用两种）。
+    card_tail = build_strategy_card(next_point, strict=True) if next_point else ""
     return head + asked + focus + tb + opener_line + (
         "1. **追问的方向必须始终朝着他的论证本身**——他那句话立不立得住、那个例子撑不撑得住"
         "观点、有没有反例、有没有例外。**不要滑到对他举的例子做细节考据**"
@@ -627,7 +632,11 @@ def build_turn_nudge(stage, is_opening=False, last_user="", wrap_mode="", turn_n
         "一组对比上），不要把那句质询再问一遍。他已经答明白的点就往前推进到下一个断裂点。\n"
         "5. 不许用“你提到”“我想问一下”“能否具体说明”“换句话说”“从某种程度上”这类套话开头，"
         "不许复述他的话、也不要引用作文里的原句当开场。\n"
-        "6. 回复说完就完了，不要附任何标注、括号说明、JSON 或记号。）")
+        "6. **这一回合绝不要收尾**——时机还没到，收尾由系统决定，不是由你决定。"
+        "不许出现“我们来回顾一下”“这组问题就聊到这里”“你已经做得很好了”这类话，"
+        "也不许替他总结；整条回复就是这一问，问他，然后等他答。\n"
+        "7. 回复说完就完了，不要附任何标注、括号说明、JSON 或记号。）\n"
+        + card_tail)
 
 
 def call_zhipu(system_prompt, history, json_mode=False, temperature=0.6):
@@ -685,7 +694,10 @@ JUDGE_TEMPLATE = """下面是一段高中议论文陪练对话，AI 扮演“只
 
 1. strategy —— AI 这一轮主要用的是哪一种追问策略（从下面选最贴近的一个）：
    - 退一步：追问某个关键词、概念到底指什么，要求他把话说清楚；
-   - 环顾式：追问例子与观点之间凭什么成立，为什么这个例子能证明他的观点；
+   - 环顾式：追问**材料与主张之间那一环推理**——他举的例子／引的名言凭什么能说明
+     他的观点、中间那一步是怎么连上的、还差什么才撑得住；
+     （和“进一步”的分界：环顾式问的是“这条推理连不连得上”，
+      进一步问的是“顺着这个结论走下去会有什么后果／更深层含义”）
    - 对立面：追问有没有人反对、什么条件下不成立、话是不是说太满；
    - 跳出去：换一个视角/领域/情境来检验结论，或指出他用的材料太旧；
    - 进一步：顺着他的结论往下问，问后果、影响、更深一层的意思。
@@ -749,8 +761,15 @@ def judge_turn(last_user, ai_reply):
 
 
 # 判定调用失败时的保守兜底：只有出现这些明确话术才认定收尾，避免误判提前收摊
-WRAPUP_HINTS = ("这组问题到这儿", "聊到这儿", "这组聊完", "已经聊完", "咱们就到这",
-                "就聊到这儿", "这组问题就到这里", "本组聊完")
+# 收尾话术的信号词。词表是实测攒出来的：模型爱说「这组问题我们就聊到这里」
+# 「我们来回顾一下这次对话」「可以开始下一轮了」，早期版本只写了「聊到这儿」，
+# 漏掉了带"我们"的写法，于是"第 1 个来回就自己收摊"这种最要命的情况一条都拦不住。
+WRAPUP_HINTS = ("这组问题到这儿", "这组问题就到", "这组问题就聊到",
+                "聊到这儿", "聊到这里", "就聊到这儿", "就聊到这里",
+                "这组聊完", "已经聊完", "咱们就到这", "本组聊完",
+                "我们来回顾一下", "回顾一下这次对话", "回顾一下我们",
+                "梳理一下我们", "总结一这下这组", "这组问题到这儿",
+                "可以开始下一轮", "进入下一轮", "开始下一轮", "下一轮讨论")
 
 
 def looks_like_wrapup(text):
@@ -783,6 +802,10 @@ JUDGE_POINT_TEMPLATE = """这是一篇高中议论文，和围绕它已经发生
 - 限定缺失：他把话说得太满，没交代什么条件下成立、什么情况下不成立；
 - 反驳缺席：他从没想过有人会反对，也没交代反方会怎么说；
 - 元认知反思缺失：上面几处他都已经用自己的话说清楚了（哪怕不够严谨），该收尾让他回看了。
+
+**优先顺序**：研究报告认定高中议论文最常断的是**担保断裂**（举了例子却没说它凭什么能支撑
+观点）和**反驳缺席**（从没想过有人会反对）。作文里确实存在这两处时，优先在它们之间选，
+再考虑其余四个点。
 
 请判断两点：
 1. covered —— 学生**已经在回答里用自己的话说清楚**的断裂点（他给出了解释、让步或反例就算，哪怕不完美；只是重申观点、只是给词下定义、只是又举一个例子，不算）。
@@ -1021,6 +1044,26 @@ def generate_assistant(stage, history, last_user="", essay="", round_num=1, prev
                             "② 他自己作文（或他刚说的话）里写到的那一句。\n"
                             "没有可引的，就只拿他自己已经写下的原句当抓手。"
                             % _unknown[0])
+            # (d) 收尾过早：还没问够 MIN_TURNS_BEFORE_WRAP 个来回，它自己就"收摊"了。
+            #     实测 p2/p3 只跑 1 个回合就收尾——对话一短，六个断裂点走不到
+            #     担保断裂，「环顾式」自然一次都出不来。收尾时机归系统管，不归它管。
+            if not bad and wrap_mode not in ("now", "after") \
+                    and turn_no < MIN_TURNS_BEFORE_WRAP and looks_like_wrapup(_clean):
+                bad = "第 %d 个来回就收尾了（太早）" % turn_no
+                note = ("【上一条回复作废】你这才第 %d 个来回就把这组问题收掉了——"
+                        "学生还没来得及把自己的说法说清楚。**这一回合不要收尾**，"
+                        "删掉「我们来回顾一下」「这组问题就聊到这里」「你已经做得很好了」"
+                        "这类话，也不要替他总结。整条回复就是这一问：问他，然后等他答。"
+                        % turn_no)
+            # (e) 追问回合必须以问句收尾——没有问号就是它自己收掉了、或者在空转。
+            if (not bad and wrap_mode not in ("now", "after")
+                    and count_questions(_clean) == 0):
+                bad = "这一回合没有提问"
+                note = ("【上一条回复作废】你这一条里没有问题。"
+                        "**这一回合只是追问，不是收尾**——收尾的时机由系统决定。"
+                        "请重写：**整条回复就以一句问句结束**，"
+                        "不许评价、不许总结、不许说“我们聊到这里”。"
+                        "只问那一处他还没说清的地方。")
             text, leaked_strategy, leaked_wrap = _clean, _leak_s, _leak_w
             if not bad:
                 break
@@ -1040,8 +1083,18 @@ def generate_assistant(stage, history, last_user="", essay="", round_num=1, prev
     if not strategy and leaked_strategy:
         strategy = leaked_strategy
     wrap = bool(judged_wrap or leaked_wrap)
+    # 收尾下限：不足 MIN_TURNS_BEFORE_WRAP 个来回，判成"已收尾"一律作废。
+    # 实测 p2/p3 才答 1 句 AI 就自己收摊了——对话一短，六个断裂点根本走不到
+    # 担保断裂，「环顾式」再怎么绑也用不上。
+    if turn_no < MIN_TURNS_BEFORE_WRAP:
+        wrap = False
+        if strategy == "回顾看":
+            # 没问够就判成收尾：这个标签不作数（多半是模型自己收了摊），
+            # 留空让研究者人工编码，对话照常往下走。
+            strategy = ""
     # 判定失败时的保守兜底：正文里出现了明确的收尾话术，才认定已收尾
-    if not wrap and not strategy and looks_like_wrapup(text):
+    if not wrap and not strategy and looks_like_wrapup(text) and \
+            turn_no >= MIN_TURNS_BEFORE_WRAP:
         wrap, strategy = True, "回顾看"
     return text, strategy, wrap
 
@@ -1076,10 +1129,16 @@ def ensure_round_conversation(student_id, essay="", topic=""):
         "VALUES(?,?,?,?,?,?,?)",
         (student_id, round_num, stage, base_essay, draft_type, topic, now_str()))
     conv_id = cur.lastrowid
+    # 【2026-10-15】开场白的历史上下文只取**本轮次及更早**的对话，并排除本条。
+    # 原来只按 student_id 取，于是同一轮换题重开留下的旧对话、后续各轮的消息
+    # 全被塞进来——模型一看"已经聊了这么久"，开场就直接收尾（实测第 2 篇起
+    # 几乎都是一问就收），这组数据等于没问。
+    # 保留 c.round<=round_num 是为了第2轮开场能对照第1轮原稿的对话。
     hist_rows = conn.execute(
-        "SELECT role, content FROM messages m JOIN conversations c "
-        "ON c.id=m.conversation_id WHERE c.student_id=? ORDER BY m.id",
-        (student_id,)).fetchall()
+        "SELECT m.role, m.content FROM messages m JOIN conversations c "
+        "ON c.id=m.conversation_id WHERE c.student_id=? AND c.round<=? "
+        "AND c.id<>? ORDER BY m.id",
+        (student_id, round_num, conv_id)).fetchall()
     history_ctx = [(r["role"], r["content"]) for r in hist_rows]
     if stage == 1:
         opening, strategy, _ = generate_assistant(1, history_ctx, essay=base_essay,
